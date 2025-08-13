@@ -28,7 +28,13 @@ async def permissions_policy(request: Request, call_next):
     return resp
 
 # Faster, smaller model for free hosting (OK for MVP)
-whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+# Lazy-load the model to avoid slow startup and crashes
+whisper_model = None
+def get_whisper():
+    global whisper_model
+    if whisper_model is None:
+        whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+    return whisper_model
 
 PART1_TOPICS = {
     "home": [
@@ -156,7 +162,7 @@ async def upload(
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio.filename or ".webm")[1]) as f:
         f.write(await audio.read())
         path = f.name
-    seg_iter, info = whisper_model.transcribe(path, language="en")
+    seg_iter, info = get_whisper().transcribe(path, language="en")
     segs = list(seg_iter)
     text = " ".join(s.text.strip() for s in segs).strip()
     if segs:
