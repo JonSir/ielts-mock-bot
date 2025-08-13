@@ -24,8 +24,10 @@ app.add_middleware(
 @app.middleware("http")
 async def permissions_policy(request: Request, call_next):
     resp = await call_next(request)
-    # Allow mic and (hint) autoplay from this origin
+    # Allow mic + autoplay from this origin (helps some webviews)
     resp.headers["Permissions-Policy"] = "microphone=(self), autoplay=(self)"
+    # Older header name for wider compatibility
+    resp.headers["Feature-Policy"] = "microphone 'self'; autoplay 'self'"
     return resp
 
 # Faster, smaller model for free hosting (OK for MVP)
@@ -110,27 +112,6 @@ def new_session(user_id: str) -> Dict[str, Any]:
         "start_ts": time.time()
     }
     return SESSIONS[sid]
-
-def summarize(scores: Dict[str,float], metrics: Dict[str,float]) -> str:
-    lines = []
-    f = scores["fluency"]; l = scores["lexical_resource"]; g = scores["grammar_range_accuracy"]; p = scores["pronunciation"]
-    if f >= 6.5:
-        lines.append("Fluency: You spoke at a steady pace with generally coherent development; fillers and pauses did not impede communication.")
-    else:
-        lines.append("Fluency: Pace and pausing sometimes disrupted flow; aim to extend answers and reduce fillers for smoother delivery.")
-    if l >= 6.5:
-        lines.append("Lexical resource: Good range with appropriate word choice; limited repetition and some topic-specific vocabulary.")
-    else:
-        lines.append("Lexical resource: Range was somewhat limited with repetition; try to vary expressions and use more precise terms.")
-    if g >= 6.5:
-        lines.append("Grammar: Mostly accurate with a mix of simple and some complex structures; few errors affecting meaning.")
-    else:
-        lines.append("Grammar: Frequent basic errors and limited variety; practice complex sentences and check subject–verb agreement.")
-    if p >= 6.5:
-        lines.append("Pronunciation: Generally clear with understandable rhythm; minor issues did not reduce intelligibility.")
-    else:
-        lines.append("Pronunciation: Clarity and rhythm varied; work on connected speech and reduce hesitations.")
-    return " ".join(lines[:4])
 
 @app.post("/api/tts")
 async def tts(text: str = Query(..., max_length=1200), voice_id: str | None = None, model_id: str = "eleven_multilingual_v2"):
@@ -266,10 +247,12 @@ async def telegram_webhook(update: Dict[str, Any]):
     if "message" in update:
         chat_id = update["message"]["chat"]["id"]
         text = update["message"].get("text", "")
+        # Add cache-busting query so Telegram reloads latest UI
+        url = f"{PUBLIC_BASE_URL}/webapp?v=4"
         if text.startswith("/start"):
-            await send_webapp_button(chat_id, "Start Mock Speaking", f"{PUBLIC_BASE_URL}/webapp")
+            await send_webapp_button(chat_id, "Start Mock Speaking", url)
         else:
-            await send_webapp_button(chat_id, "Start Mock Speaking", f"{PUBLIC_BASE_URL}/webapp")
+            await send_webapp_button(chat_id, "Start Mock Speaking", url)
     return {"ok": True}
 
 async def send_webapp_button(chat_id: int, label: str, url: str):
@@ -308,7 +291,7 @@ HTML = """
   <div id="overlay" class="overlay">
     <div class="center">
       <h2>Mock IELTS Speaking</h2>
-      <p>Tap the button to enable sound and microphone.</p>
+      <p id="overlayMsg">Tap the button to enable sound and microphone.</p>
       <button id="startBtn" class="btn">Tap to Start</button>
       <div class="small">If it doesn’t work, close and open again, then tap this button.</div>
     </div>
@@ -346,6 +329,7 @@ function beep(ms = 200, freq = 880) {
   } catch (e) {}
 }
 
+// Try to speak text; if autoplay is blocked, continue anyway.
 async function speak(text, { onend } = {}) {
   try {
     const res = await fetch(`/api/tts?text=${encodeURIComponent(text)}`, { method: 'POST' });
@@ -356,10 +340,7 @@ async function speak(text, { onend } = {}) {
     audio.onended = () => { URL.revokeObjectURL(url); onend && onend(); };
     const p = audio.play();
     if (p && p.catch) {
-      p.catch(err => {
-        console.warn('Autoplay blocked, continuing without audio:', err);
-        onend && onend(); // avoid deadlock if audio can’t start
-      });
+      p.catch(err => { console.warn('Autoplay blocked:', err); onend && onend(); });
     }
   } catch (e) {
     console.error('speak error', e);
@@ -380,7 +361,6 @@ function selectMimeType() {
   }
   return '';
 }
-
 function extFromMime(m) {
   if (!m) return 'webm';
   if (m.includes('mp4')) return 'mp4';
@@ -390,7 +370,7 @@ function extFromMime(m) {
 
 async function startRecording() {
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
   } catch (e) {
     alert('Microphone permission is required. Please allow it and try again.');
     throw e;
@@ -413,7 +393,6 @@ async function startRecording() {
   recStart = Date.now();
   mediaRecorder.start();
 }
-
 function stopRecording() { try { mediaRecorder && mediaRecorder.stop(); } catch (e) {} }
 
 function showTranscriptEditor(initialText, confidence) {
@@ -513,23 +492,36 @@ async function bootstrap() {
   await speak(data.speak, { onend: async () => { await advanceExam({ next_question: data.next_question }); }});
 }
 
-// Require a tap to unlock audio + mic, then start
+// Request mic before hiding overlay; keep overlay visible if user didn't grant yet.
 async function userStart() {
+  const msg = document.getElementById('overlayMsg');
+  const btn = document.getElementById('startBtn');
+  btn.disabled = true;
+  msg.textContent = 'Requesting microphone permission…';
+
+  // Unlock audio within gesture
   try {
-    // Unlock audio: play a nearly silent beep within user gesture
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const o = ctx.createOscillator(); const g = ctx.createGain();
     g.gain.value = 0.001; o.connect(g); g.connect(ctx.destination); o.start();
     setTimeout(() => { o.stop(); ctx.close(); }, 30);
   } catch (e) {}
-  // Pre-ask mic permission so later startRecording is instant
+
+  let granted = false;
   try {
-    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const s = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
     s.getTracks().forEach(t => t.stop());
+    granted = true;
   } catch (e) {
-    // User can still grant when we startRecording()
-    console.warn('Pre-ask mic failed', e);
+    console.warn('Mic request failed or was denied:', e);
   }
+
+  if (!granted) {
+    msg.textContent = 'Microphone permission is required. Tap the button again, then press "Allow" in the popup.';
+    btn.disabled = false;
+    return;
+  }
+
   document.getElementById('overlay').style.display = 'none';
   await bootstrap();
 }
