@@ -248,7 +248,7 @@ async def telegram_webhook(update: Dict[str, Any]):
         chat_id = update["message"]["chat"]["id"]
         text = update["message"].get("text", "")
         # Add cache-busting query so Telegram reloads latest UI
-        url = f"{PUBLIC_BASE_URL}/webapp?v=4"
+        url = f"{PUBLIC_BASE_URL}/webapp?v=5"
         if text.startswith("/start"):
             await send_webapp_button(chat_id, "Start Mock Speaking", url)
         else:
@@ -267,24 +267,26 @@ async def send_webapp_button(chat_id: int, label: str, url: str):
             json={"chat_id": chat_id, "text": "Tap to begin your mock speaking test:", "reply_markup": kb}
         )
 
-HTML = """
+HTML = f"""
 <!doctype html>
 <html><head>
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>IELTS Mock Speaking</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 0; padding: 16px; background: #0b0f19; color: #fff; }
-    .card { max-width: 760px; margin: 0 auto; background: #141a2a; border-radius: 12px; padding: 16px; }
-    .q { font-size: 1.2rem; margin: 12px 0; }
-    .status { color: #aab; margin: 8px 0; }
-    #transcriptEdit { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334; background: #0e1320; color: #fff; }
-    .row { display: flex; gap: 10px; align-items: center; }
-    .btn { background: #2b6; border: none; color: #fff; padding: 10px 14px; border-radius: 8px; cursor: pointer; }
-    .btn:disabled { background: #345; cursor: not-allowed; }
-    .overlay { position: fixed; inset: 0; background: rgba(11,15,25,0.95); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-    .overlay .center { text-align: center; max-width: 640px; padding: 0 16px; }
-    .small { font-size: 0.9rem; color: #aab; margin-top: 8px; }
+    body {{ font-family: system-ui, Arial, sans-serif; margin: 0; padding: 16px; background: #0b0f19; color: #fff; }}
+    .card {{ max-width: 760px; margin: 0 auto; background: #141a2a; border-radius: 12px; padding: 16px; }}
+    .q {{ font-size: 1.2rem; margin: 12px 0; }}
+    .status {{ color: #aab; margin: 8px 0; }}
+    #transcriptEdit {{ width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334; background: #0e1320; color: #fff; }}
+    .row {{ display: flex; gap: 10px; align-items: center; }}
+    .btn {{ background: #2b6; border: none; color: #fff; padding: 10px 14px; border-radius: 8px; cursor: pointer; }}
+    .btn:disabled {{ background: #345; cursor: not-allowed; }}
+    .overlay {{ position: fixed; inset: 0; background: rgba(11,15,25,0.95); display: flex; align-items: center; justify-content: center; z-index: 1000; }}
+    .overlay .center {{ text-align: center; max-width: 640px; padding: 0 16px; }}
+    .small {{ font-size: 0.9rem; color: #aab; margin-top: 8px; }}
+    .hint {{ font-size: 0.9rem; color: #9ac; margin-top: 10px; }}
+    a.link {{ color: #7cf; }}
   </style>
 </head>
 <body>
@@ -294,6 +296,8 @@ HTML = """
       <p id="overlayMsg">Tap the button to enable sound and microphone.</p>
       <button id="startBtn" class="btn">Tap to Start</button>
       <div class="small">If it doesn’t work, close and open again, then tap this button.</div>
+      <div class="hint">If you use Telegram Desktop and the mic doesn't appear, open it in your browser instead:</div>
+      <div class="small"><a id="openExternal" class="link" href="{PUBLIC_BASE_URL}/webapp" target="_blank" rel="noopener">Open in browser</a></div>
     </div>
   </div>
 
@@ -317,38 +321,49 @@ let currentQuestionId = null;
 let recStart = 0;
 let mediaRecorder, chunks = [], stream;
 
-function beep(ms = 200, freq = 880) {
-  try {
+function beep(ms = 200, freq = 880) {{
+  try {{
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const o = ctx.createOscillator();
     const g = ctx.createGain();
     g.gain.value = 0.05;
     o.connect(g); g.connect(ctx.destination);
     o.frequency.value = freq; o.start();
-    setTimeout(() => { o.stop(); ctx.close(); }, ms);
-  } catch (e) {}
-}
+    setTimeout(() => {{ o.stop(); ctx.close(); }}, ms);
+  }} catch (e) {{}}
+}}
 
-// Try to speak text; if autoplay is blocked, continue anyway.
-async function speak(text, { onend } = {}) {
-  try {
-    const res = await fetch(`/api/tts?text=${encodeURIComponent(text)}`, { method: 'POST' });
-    if (!res.ok) { console.error('TTS failed'); onend && onend(); return; }
+// Speak with fail-safe: continue even if audio can't autoplay
+async function speak(text, {{ onend }} = {{}}) {{
+  try {{
+    const res = await fetch(`/api/tts?text=${{encodeURIComponent(text)}}`, {{ method: 'POST' }});
+    if (!res.ok) {{ console.error('TTS failed'); onend && onend(); return; }}
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
-    audio.onended = () => { URL.revokeObjectURL(url); onend && onend(); };
+    let done = false;
+    const finish = () => {{
+      if (done) return;
+      done = true;
+      try {{ URL.revokeObjectURL(url); }} catch(e) {{}}
+      onend && onend();
+    }};
+    const fallback = setTimeout(finish, 2000); // 2s fallback
+    audio.onplaying = () => clearTimeout(fallback);
+    audio.onended = finish;
     const p = audio.play();
-    if (p && p.catch) {
-      p.catch(err => { console.warn('Autoplay blocked:', err); onend && onend(); });
-    }
-  } catch (e) {
+    if (p && p.catch) {{
+      p.catch(err => {{ console.warn('Autoplay blocked:', err); finish(); }});
+    }} else {{
+      // Some webviews return undefined; rely on fallback timer
+    }}
+  }} catch (e) {{
     console.error('speak error', e);
     onend && onend();
-  }
-}
+  }}
+}}
 
-function selectMimeType() {
+function selectMimeType() {{
   const types = [
     'audio/webm;codecs=opus',
     'audio/webm',
@@ -356,175 +371,184 @@ function selectMimeType() {
     'audio/mpeg'
   ];
   if (!window.MediaRecorder) return '';
-  for (const t of types) {
+  for (const t of types) {{
     if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
-  }
+  }}
   return '';
-}
-function extFromMime(m) {
+}}
+function extFromMime(m) {{
   if (!m) return 'webm';
   if (m.includes('mp4')) return 'mp4';
   if (m.includes('mpeg')) return 'mp3';
   return 'webm';
-}
+}}
 
-async function startRecording() {
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-  } catch (e) {
-    alert('Microphone permission is required. Please allow it and try again.');
+async function startRecording() {{
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
+    alert('Your app cannot access the microphone here. Please tap "Open in browser" and try in Chrome.');
+    throw new Error('getUserMedia not available');
+  }}
+  try {{
+    stream = await navigator.mediaDevices.getUserMedia({{ audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }} }});
+  }} catch (e) {{
+    alert('Microphone permission is required. Please allow it and try again. If it doesn’t appear, open in your browser.');
     throw e;
-  }
+  }}
   const mimeType = selectMimeType();
-  const options = mimeType ? { mimeType } : undefined;
-  try {
+  const options = mimeType ? {{ mimeType }} : undefined;
+  try {{
     mediaRecorder = new MediaRecorder(stream, options);
-  } catch (e) {
+  }} catch (e) {{
     console.error('MediaRecorder init failed, trying without options', e);
     mediaRecorder = new MediaRecorder(stream);
-  }
+  }}
   chunks = [];
   mediaRecorder.ondataavailable = e => e.data && chunks.push(e.data);
-  mediaRecorder.onstop = async () => {
-    const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+  mediaRecorder.onstop = async () => {{
+    const blob = new Blob(chunks, {{ type: mediaRecorder.mimeType }});
     await uploadAnswer(blob, extFromMime(mediaRecorder.mimeType));
     stream.getTracks().forEach(t => t.stop());
-  };
+  }};
   recStart = Date.now();
   mediaRecorder.start();
-}
-function stopRecording() { try { mediaRecorder && mediaRecorder.stop(); } catch (e) {} }
+}}
+function stopRecording() {{ try {{ mediaRecorder && mediaRecorder.stop(); }} catch (e) {{}} }}
 
-function showTranscriptEditor(initialText, confidence) {
+function showTranscriptEditor(initialText, confidence) {{
   const input = document.getElementById('transcriptEdit');
   input.value = initialText || '';
   const timer = document.getElementById('editTimer');
   let left = 5;
-  timer.textContent = `${left}s to auto-confirm`;
-  const iv = setInterval(() => {
+  timer.textContent = `${{left}}s to auto-confirm`;
+  const iv = setInterval(() => {{
     left -= 1;
-    timer.textContent = `${left}s to auto-confirm`;
-    if (left <= 0) {
+    timer.textContent = `${{left}}s to auto-confirm`;
+    if (left <= 0) {{
       clearInterval(iv);
       confirmTranscript(input.value);
-    }
-  }, 1000);
-  document.getElementById('confirmBtn').onclick = () => {
+    }}
+  }}, 1000);
+  document.getElementById('confirmBtn').onclick = () => {{
     clearInterval(iv);
     confirmTranscript(input.value);
-  };
-}
+  }};
+}}
 
-async function uploadAnswer(blob, ext = 'webm') {
+async function uploadAnswer(blob, ext = 'webm') {{
   const fd = new FormData();
-  fd.append('audio', blob, `answer.${ext}`);
+  fd.append('audio', blob, `answer.${{ext}}`);
   fd.append('session_id', sessionId);
   fd.append('part', currentPart);
   fd.append('question_id', currentQuestionId);
   fd.append('duration_ms', String(Date.now() - recStart));
-  const res = await fetch('/api/upload', { method: 'POST', body: fd });
+  const res = await fetch('/api/upload', {{ method: 'POST', body: fd }});
   const json = await res.json();
   showTranscriptEditor(json.transcript, json.confidence);
-}
+}}
 
-async function confirmTranscript(text) {
-  const res = await fetch('/api/transcript/confirm', {
+async function confirmTranscript(text) {{
+  const res = await fetch('/api/transcript/confirm', {{
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_id: sessionId, part: currentPart, question_id: currentQuestionId, transcript: text, duration_ms: (Date.now() - recStart) })
-  });
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ session_id: sessionId, part: currentPart, question_id: currentQuestionId, transcript: text, duration_ms: (Date.now() - recStart) }})
+  }});
   const next = await res.json();
   advanceExam(next);
-}
+}}
 
-function setQuestion(q) { document.getElementById('question').textContent = q || ''; }
-function setStage(s) { document.getElementById('stage').textContent = s || ''; }
+function setQuestion(q) {{ document.getElementById('question').textContent = q || ''; }}
+function setStage(s) {{ document.getElementById('stage').textContent = s || ''; }}
 
-async function advanceExam(payload) {
-  if (payload.result) {
+async function advanceExam(payload) {{
+  if (payload.result) {{
     setStage('Test finished.');
-    setQuestion(`Overall ${payload.result.overall} — Fluency ${payload.result.fluency}, Lexis ${payload.result.lexical_resource}, Grammar ${payload.result.grammar_range_accuracy}, Pron ${payload.result.pronunciation}. ${payload.result.summary}`);
+    setQuestion(`Overall ${{payload.result.overall}} — Fluency ${{payload.result.fluency}}, Lexis ${{payload.result.lexical_resource}}, Grammar ${{payload.result.grammar_range_accuracy}}, Pron ${{payload.result.pronunciation}}. ${{payload.result.summary}}`);
     return;
-  }
-  if (payload.instruction && payload.part === 2) {
+  }}
+  if (payload.instruction && payload.part === 2) {{
     setStage('Part 2: Preparation (60s)…');
     setQuestion(payload.cue_card);
-    await speak(payload.instruction, { onend: async () => {
+    await speak(payload.instruction, {{ onend: async () => {{
       beep(200);
-      setTimeout(async () => {
+      setTimeout(async () => {{
         setStage('Part 2: Speak for up to 2 minutes…');
         beep(200);
-        await speak('You may begin.', { onend: async () => {
+        await speak('You may begin.', {{ onend: async () => {{
           currentPart = 2; currentQuestionId = 'p2_main';
           await startRecording();
-          setTimeout(() => { stopRecording(); beep(200); }, 120000);
-        }});
-      }, 60000);
-    }});
+          setTimeout(() => {{ stopRecording(); beep(200); }}, 120000);
+        }}}});
+      }}, 60000);
+    }}}});
     return;
-  }
-  if (payload.next_question) {
+  }}
+  if (payload.next_question) {{
     const q = payload.next_question;
     currentPart = q.part; currentQuestionId = q.question_id;
-    setStage(`Part ${q.part}`);
+    setStage(`Part ${{q.part}}`);
     setQuestion(q.text);
-    await speak(q.text, { onend: async () => {
+    await speak(q.text, {{ onend: async () => {{
       beep(120);
       await startRecording();
       const limit = (q.part === 1) ? 40000 : 50000;
-      setTimeout(() => { stopRecording(); }, limit);
-    }});
-  }
-}
+      setTimeout(() => {{ stopRecording(); }}, limit);
+    }}}});
+  }}
+}}
 
-async function bootstrap() {
+async function bootstrap() {{
   const tgUserId = tg?.initDataUnsafe?.user?.id || 'anon';
-  const res = await fetch('/api/session/start', {
+  const res = await fetch('/api/session/start', {{
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tg_user_id: tgUserId })
-  });
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ tg_user_id: tgUserId }})
+  }});
   const data = await res.json();
   sessionId = data.session_id;
   currentPart = 1;
   currentQuestionId = data.next_question.question_id;
   setStage('Part 1');
-  await speak(data.speak, { onend: async () => { await advanceExam({ next_question: data.next_question }); }});
-}
+  await speak(data.speak, {{ onend: async () => {{ await advanceExam({{ next_question: data.next_question }}); }}}});
+}}
 
 // Request mic before hiding overlay; keep overlay visible if user didn't grant yet.
-async function userStart() {
+async function userStart() {{
   const msg = document.getElementById('overlayMsg');
   const btn = document.getElementById('startBtn');
   btn.disabled = true;
   msg.textContent = 'Requesting microphone permission…';
 
   // Unlock audio within gesture
-  try {
+  try {{
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const o = ctx.createOscillator(); const g = ctx.createGain();
     g.gain.value = 0.001; o.connect(g); g.connect(ctx.destination); o.start();
-    setTimeout(() => { o.stop(); ctx.close(); }, 30);
-  } catch (e) {}
+    setTimeout(() => {{ o.stop(); ctx.close(); }}, 30);
+  }} catch (e) {{}}
 
   let granted = false;
-  try {
-    const s = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-    s.getTracks().forEach(t => t.stop());
-    granted = true;
-  } catch (e) {
-    console.warn('Mic request failed or was denied:', e);
-  }
-
-  if (!granted) {
-    msg.textContent = 'Microphone permission is required. Tap the button again, then press "Allow" in the popup.';
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
+    msg.textContent = 'This app cannot access your microphone here. Try "Open in browser".';
     btn.disabled = false;
     return;
-  }
+  }}
+  try {{
+    const s = await navigator.mediaDevices.getUserMedia({{ audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }} }});
+    s.getTracks().forEach(t => t.stop());
+    granted = true;
+  }} catch (e) {{
+    console.warn('Mic request failed or was denied:', e);
+  }}
+
+  if (!granted) {{
+    msg.textContent = 'Microphone permission is required. Tap again and press "Allow" in the popup. If no popup appears, tap "Open in browser".';
+    btn.disabled = false;
+    return;
+  }}
 
   document.getElementById('overlay').style.display = 'none';
   await bootstrap();
-}
+}}
 
 document.getElementById('startBtn').addEventListener('click', userStart);
 </script>
