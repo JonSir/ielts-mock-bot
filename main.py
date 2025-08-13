@@ -24,17 +24,12 @@ app.add_middleware(
 @app.middleware("http")
 async def permissions_policy(request: Request, call_next):
     resp = await call_next(request)
-    resp.headers["Permissions-Policy"] = "microphone=(self)"
+    # Allow mic and (hint) autoplay from this origin
+    resp.headers["Permissions-Policy"] = "microphone=(self), autoplay=(self)"
     return resp
 
 # Faster, smaller model for free hosting (OK for MVP)
-# Lazy-load the model to avoid slow startup and crashes
-whisper_model = None
-def get_whisper():
-    global whisper_model
-    if whisper_model is None:
-        whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
-    return whisper_model
+whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
 
 PART1_TOPICS = {
     "home": [
@@ -162,7 +157,7 @@ async def upload(
     with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio.filename or ".webm")[1]) as f:
         f.write(await audio.read())
         path = f.name
-    seg_iter, info = get_whisper().transcribe(path, language="en")
+    seg_iter, info = whisper_model.transcribe(path, language="en")
     segs = list(seg_iter)
     text = " ".join(s.text.strip() for s in segs).strip()
     if segs:
@@ -304,9 +299,21 @@ HTML = """
     .row { display: flex; gap: 10px; align-items: center; }
     .btn { background: #2b6; border: none; color: #fff; padding: 10px 14px; border-radius: 8px; cursor: pointer; }
     .btn:disabled { background: #345; cursor: not-allowed; }
+    .overlay { position: fixed; inset: 0; background: rgba(11,15,25,0.95); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+    .overlay .center { text-align: center; max-width: 640px; padding: 0 16px; }
+    .small { font-size: 0.9rem; color: #aab; margin-top: 8px; }
   </style>
 </head>
 <body>
+  <div id="overlay" class="overlay">
+    <div class="center">
+      <h2>Mock IELTS Speaking</h2>
+      <p>Tap the button to enable sound and microphone.</p>
+      <button id="startBtn" class="btn">Tap to Start</button>
+      <div class="small">If it doesn’t work, close and open again, then tap this button.</div>
+    </div>
+  </div>
+
   <div class="card">
     <div id="stage" class="status">Initializing…</div>
     <div id="question" class="q"></div>
@@ -316,6 +323,7 @@ HTML = """
       <div id="editTimer" class="status"></div>
     </div>
   </div>
+
 <script>
 const tg = window.Telegram?.WebApp;
 tg && tg.expand();
@@ -324,41 +332,89 @@ let sessionId = null;
 let currentPart = 1;
 let currentQuestionId = null;
 let recStart = 0;
+let mediaRecorder, chunks = [], stream;
+
+function beep(ms = 200, freq = 880) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    g.gain.value = 0.05;
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.value = freq; o.start();
+    setTimeout(() => { o.stop(); ctx.close(); }, ms);
+  } catch (e) {}
+}
 
 async function speak(text, { onend } = {}) {
-  const res = await fetch(`/api/tts?text=${encodeURIComponent(text)}`, { method: 'POST' });
-  if (!res.ok) { console.error('TTS failed'); return onend && onend(); }
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const audio = new Audio(url);
-  audio.onended = () => { URL.revokeObjectURL(url); onend && onend(); };
-  audio.play();
+  try {
+    const res = await fetch(`/api/tts?text=${encodeURIComponent(text)}`, { method: 'POST' });
+    if (!res.ok) { console.error('TTS failed'); onend && onend(); return; }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.onended = () => { URL.revokeObjectURL(url); onend && onend(); };
+    const p = audio.play();
+    if (p && p.catch) {
+      p.catch(err => {
+        console.warn('Autoplay blocked, continuing without audio:', err);
+        onend && onend(); // avoid deadlock if audio can’t start
+      });
+    }
+  } catch (e) {
+    console.error('speak error', e);
+    onend && onend();
+  }
 }
 
-function beep(ms = 400, freq = 1000) {
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
-  const o = ctx.createOscillator();
-  const g = ctx.createGain();
-  o.connect(g); g.connect(ctx.destination);
-  o.frequency.value = freq; o.start();
-  setTimeout(() => { o.stop(); ctx.close(); }, ms);
+function selectMimeType() {
+  const types = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/mpeg'
+  ];
+  if (!window.MediaRecorder) return '';
+  for (const t of types) {
+    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';
 }
 
-let mediaRecorder, chunks = [], stream;
+function extFromMime(m) {
+  if (!m) return 'webm';
+  if (m.includes('mp4')) return 'mp4';
+  if (m.includes('mpeg')) return 'mp3';
+  return 'webm';
+}
+
 async function startRecording() {
-  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    alert('Microphone permission is required. Please allow it and try again.');
+    throw e;
+  }
+  const mimeType = selectMimeType();
+  const options = mimeType ? { mimeType } : undefined;
+  try {
+    mediaRecorder = new MediaRecorder(stream, options);
+  } catch (e) {
+    console.error('MediaRecorder init failed, trying without options', e);
+    mediaRecorder = new MediaRecorder(stream);
+  }
   chunks = [];
   mediaRecorder.ondataavailable = e => e.data && chunks.push(e.data);
   mediaRecorder.onstop = async () => {
-    const blob = new Blob(chunks, { type: 'audio/webm' });
-    await uploadAnswer(blob);
+    const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+    await uploadAnswer(blob, extFromMime(mediaRecorder.mimeType));
     stream.getTracks().forEach(t => t.stop());
   };
   recStart = Date.now();
   mediaRecorder.start();
 }
-function stopRecording() { mediaRecorder && mediaRecorder.stop(); }
+
+function stopRecording() { try { mediaRecorder && mediaRecorder.stop(); } catch (e) {} }
 
 function showTranscriptEditor(initialText, confidence) {
   const input = document.getElementById('transcriptEdit');
@@ -380,9 +436,9 @@ function showTranscriptEditor(initialText, confidence) {
   };
 }
 
-async function uploadAnswer(blob) {
+async function uploadAnswer(blob, ext = 'webm') {
   const fd = new FormData();
-  fd.append('audio', blob, 'answer.webm');
+  fd.append('audio', blob, `answer.${ext}`);
   fd.append('session_id', sessionId);
   fd.append('part', currentPart);
   fd.append('question_id', currentQuestionId);
@@ -415,14 +471,14 @@ async function advanceExam(payload) {
     setStage('Part 2: Preparation (60s)…');
     setQuestion(payload.cue_card);
     await speak(payload.instruction, { onend: async () => {
-      beep(300);
+      beep(200);
       setTimeout(async () => {
         setStage('Part 2: Speak for up to 2 minutes…');
-        beep(300);
+        beep(200);
         await speak('You may begin.', { onend: async () => {
           currentPart = 2; currentQuestionId = 'p2_main';
           await startRecording();
-          setTimeout(() => { stopRecording(); beep(300); }, 120000);
+          setTimeout(() => { stopRecording(); beep(200); }, 120000);
         }});
       }, 60000);
     }});
@@ -437,14 +493,18 @@ async function advanceExam(payload) {
       beep(120);
       await startRecording();
       const limit = (q.part === 1) ? 40000 : 50000;
-      setTimeout(() => { try { stopRecording(); } catch(e){} }, limit);
+      setTimeout(() => { stopRecording(); }, limit);
     }});
   }
 }
 
 async function bootstrap() {
   const tgUserId = tg?.initDataUnsafe?.user?.id || 'anon';
-  const res = await fetch('/api/session/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tg_user_id: tgUserId }) });
+  const res = await fetch('/api/session/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tg_user_id: tgUserId })
+  });
   const data = await res.json();
   sessionId = data.session_id;
   currentPart = 1;
@@ -452,7 +512,29 @@ async function bootstrap() {
   setStage('Part 1');
   await speak(data.speak, { onend: async () => { await advanceExam({ next_question: data.next_question }); }});
 }
-bootstrap();
+
+// Require a tap to unlock audio + mic, then start
+async function userStart() {
+  try {
+    // Unlock audio: play a nearly silent beep within user gesture
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator(); const g = ctx.createGain();
+    g.gain.value = 0.001; o.connect(g); g.connect(ctx.destination); o.start();
+    setTimeout(() => { o.stop(); ctx.close(); }, 30);
+  } catch (e) {}
+  // Pre-ask mic permission so later startRecording is instant
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    s.getTracks().forEach(t => t.stop());
+  } catch (e) {
+    // User can still grant when we startRecording()
+    console.warn('Pre-ask mic failed', e);
+  }
+  document.getElementById('overlay').style.display = 'none';
+  await bootstrap();
+}
+
+document.getElementById('startBtn').addEventListener('click', userStart);
 </script>
 </body></html>
 """
