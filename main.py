@@ -7,16 +7,19 @@ import httpx
 from faster_whisper import WhisperModel
 from scoring import metrics_from_text_and_times, bands_from_metrics
 
+# ====== Config ======
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ELEVEN_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8000")
-ELEVEN_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")  # can change later
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:8000"
+ELEVEN_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")  # Default ElevenLabs voice
+ELEVEN_MODEL_ID = os.environ.get("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 
+# ====== App ======
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[PUBLIC_BASE_URL, "http://localhost:8000"],
-    allow_credentials=True,
+    allow_origins=["*"],  # Same-origin calls in this app; allow all to avoid misconfig friction
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -24,13 +27,14 @@ app.add_middleware(
 @app.middleware("http")
 async def permissions_policy(request: Request, call_next):
     resp = await call_next(request)
-    # Allow mic + autoplay from this origin (helps some webviews)
+    # Allow mic + autoplay (helps some embedded webviews)
     resp.headers["Permissions-Policy"] = "microphone=(self), autoplay=(self)"
-    # Older header name for wider compatibility
+    # Back-compat header name for older Chromium builds (harmless if ignored)
     resp.headers["Feature-Policy"] = "microphone 'self'; autoplay 'self'"
     return resp
 
-# Faster, smaller model for free hosting (OK for MVP)
+# ====== Models / Data ======
+# Keep tiny.en for fast CPU inference on free hosts
 whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
 
 PART1_TOPICS = {
@@ -113,14 +117,17 @@ def new_session(user_id: str) -> Dict[str, Any]:
     }
     return SESSIONS[sid]
 
+# ====== API: TTS, Upload, Exam Flow ======
 @app.post("/api/tts")
-async def tts(text: str = Query(..., max_length=1200), voice_id: str | None = None, model_id: str = "eleven_multilingual_v2"):
+async def tts(text: str = Query(..., max_length=1200), voice_id: str | None = None, model_id: str | None = None):
     if not ELEVEN_API_KEY:
+        # Still allow flow to continue on the client
         return JSONResponse({"error": "Missing ELEVENLABS_API_KEY"}, status_code=500)
     vid = voice_id or ELEVEN_VOICE_ID
+    mid = model_id or ELEVEN_MODEL_ID
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}/stream"
     headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
-    payload = {"text": text, "model_id": model_id, "voice_settings": {"stability": 0.6, "similarity_boost": 0.8}}
+    payload = {"text": text, "model_id": mid, "voice_settings": {"stability": 0.6, "similarity_boost": 0.8}}
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(url, headers=headers, json=payload)
         if r.status_code != 200:
@@ -135,9 +142,12 @@ async def upload(
     question_id: str = Form(...),
     duration_ms: int = Form(0)
 ):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio.filename or ".webm")[1]) as f:
+    # Persist temp file with the right extension so ffmpeg can decode
+    suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(await audio.read())
         path = f.name
+    # Transcribe
     seg_iter, info = whisper_model.transcribe(path, language="en")
     segs = list(seg_iter)
     text = " ".join(s.text.strip() for s in segs).strip()
@@ -146,7 +156,10 @@ async def upload(
         conf = max(0.0, min(1.0, sum(conf_vals) / len(conf_vals)))
     else:
         conf = 0.5
-    os.remove(path)
+    try:
+        os.remove(path)
+    except Exception:
+        pass
     return {"transcript": text, "confidence": conf, "duration_ms": duration_ms}
 
 @app.post("/api/session/start")
@@ -242,17 +255,14 @@ async def session_finish(payload: Dict[str, Any]):
         }
     }
 
+# ====== Telegram Webhook ======
 @app.post("/telegram/webhook")
 async def telegram_webhook(update: Dict[str, Any]):
     if "message" in update:
         chat_id = update["message"]["chat"]["id"]
-        text = update["message"].get("text", "")
-        # Add cache-busting query so Telegram reloads latest UI
-        url = f"{PUBLIC_BASE_URL}/webapp?v=5"
-        if text.startswith("/start"):
-            await send_webapp_button(chat_id, "Start Mock Speaking", url)
-        else:
-            await send_webapp_button(chat_id, "Start Mock Speaking", url)
+        # Force Telegram to reload latest webapp via cache-busting param
+        url = f"{PUBLIC_BASE_URL}/webapp?v=6"
+        await send_webapp_button(chat_id, "Start Mock Speaking", url)
     return {"ok": True}
 
 async def send_webapp_button(chat_id: int, label: str, url: str):
@@ -267,6 +277,7 @@ async def send_webapp_button(chat_id: int, label: str, url: str):
             json={"chat_id": chat_id, "text": "Tap to begin your mock speaking test:", "reply_markup": kb}
         )
 
+# ====== Web App (HTML + JS) ======
 HTML = f"""
 <!doctype html>
 <html><head>
@@ -287,6 +298,7 @@ HTML = f"""
     .small {{ font-size: 0.9rem; color: #aab; margin-top: 8px; }}
     .hint {{ font-size: 0.9rem; color: #9ac; margin-top: 10px; }}
     a.link {{ color: #7cf; }}
+    .log {{ font-size: 0.85rem; color: #8ab; margin-top: 6px; white-space: pre-line; }}
   </style>
 </head>
 <body>
@@ -296,8 +308,9 @@ HTML = f"""
       <p id="overlayMsg">Tap the button to enable sound and microphone.</p>
       <button id="startBtn" class="btn">Tap to Start</button>
       <div class="small">If it doesn’t work, close and open again, then tap this button.</div>
-      <div class="hint">If you use Telegram Desktop and the mic doesn't appear, open it in your browser instead:</div>
-      <div class="small"><a id="openExternal" class="link" href="{PUBLIC_BASE_URL}/webapp" target="_blank" rel="noopener">Open in browser</a></div>
+      <div class="hint">If Telegram Desktop blocks the mic, open in your browser:</div>
+      <div class="small"><a class="link" href="{PUBLIC_BASE_URL}/webapp?v=6" target="_blank" rel="noopener">Open in browser</a></div>
+      <div id="prelog" class="log"></div>
     </div>
   </div>
 
@@ -309,17 +322,32 @@ HTML = f"""
       <button id="confirmBtn" class="btn">Confirm</button>
       <div id="editTimer" class="status"></div>
     </div>
+    <div id="log" class="log"></div>
   </div>
 
 <script>
 const tg = window.Telegram?.WebApp;
 tg && tg.expand();
 
+const logEl = document.getElementById('log');
+const prelogEl = document.getElementById('prelog');
+function log(...args) {{
+  const s = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+  console.log('[IELTS]', ...args);
+  if (logEl) logEl.textContent = (logEl.textContent || '') + s + '\\n';
+}}
+function prelog(...args) {{
+  const s = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
+  console.log('[START]', ...args);
+  if (prelogEl) prelogEl.textContent = (prelogEl.textContent || '') + s + '\\n';
+}}
+
 let sessionId = null;
 let currentPart = 1;
 let currentQuestionId = null;
 let recStart = 0;
 let mediaRecorder, chunks = [], stream;
+let hasRecordingStarted = false;
 
 function beep(ms = 200, freq = 880) {{
   try {{
@@ -333,32 +361,35 @@ function beep(ms = 200, freq = 880) {{
   }} catch (e) {{}}
 }}
 
-// Speak with fail-safe: continue even if audio can't autoplay
+// Speak with fail-safe: proceed after 1.5–2s even if audio is blocked
 async function speak(text, {{ onend }} = {{}}) {{
+  log('speak()', text.slice(0, 80));
   try {{
     const res = await fetch(`/api/tts?text=${{encodeURIComponent(text)}}`, {{ method: 'POST' }});
-    if (!res.ok) {{ console.error('TTS failed'); onend && onend(); return; }}
+    if (!res.ok) {{
+      log('TTS HTTP error', res.status);
+      onend && onend();
+      return;
+    }}
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
-    let done = false;
+    let finished = false;
     const finish = () => {{
-      if (done) return;
-      done = true;
+      if (finished) return;
+      finished = true;
       try {{ URL.revokeObjectURL(url); }} catch(e) {{}}
       onend && onend();
     }};
-    const fallback = setTimeout(finish, 2000); // 2s fallback
+    const fallback = setTimeout(finish, 1800);
     audio.onplaying = () => clearTimeout(fallback);
     audio.onended = finish;
     const p = audio.play();
     if (p && p.catch) {{
-      p.catch(err => {{ console.warn('Autoplay blocked:', err); finish(); }});
-    }} else {{
-      // Some webviews return undefined; rely on fallback timer
+      p.catch(err => {{ log('Autoplay blocked', String(err)); finish(); }});
     }}
   }} catch (e) {{
-    console.error('speak error', e);
+    log('speak error', String(e));
     onend && onend();
   }}
 }}
@@ -366,15 +397,15 @@ async function speak(text, {{ onend }} = {{}}) {{
 function selectMimeType() {{
   const types = [
     'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/mp4',
-    'audio/mpeg'
+    'audio/webm'
   ];
   if (!window.MediaRecorder) return '';
   for (const t of types) {{
-    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+    try {{
+      if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
+    }} catch (_) {{}}
   }}
-  return '';
+  return ''; // Let browser choose default
 }}
 function extFromMime(m) {{
   if (!m) return 'webm';
@@ -384,35 +415,62 @@ function extFromMime(m) {{
 }}
 
 async function startRecording() {{
+  if (hasRecordingStarted) return;
+  hasRecordingStarted = true;
+  log('startRecording() called');
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
-    alert('Your app cannot access the microphone here. Please tap "Open in browser" and try in Chrome.');
-    throw new Error('getUserMedia not available');
+    alert('This environment does not allow microphone access. Please open in Chrome.');
+    throw new Error('getUserMedia unavailable');
   }}
   try {{
     stream = await navigator.mediaDevices.getUserMedia({{ audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }} }});
   }} catch (e) {{
-    alert('Microphone permission is required. Please allow it and try again. If it doesn’t appear, open in your browser.');
+    log('getUserMedia error', String(e));
+    alert('Microphone permission is required. Please allow it and try again.');
     throw e;
   }}
   const mimeType = selectMimeType();
   const options = mimeType ? {{ mimeType }} : undefined;
   try {{
-    mediaRecorder = new MediaRecorder(stream, options);
+    mediaRecorder = options ? new MediaRecorder(stream, options) : new MediaRecorder(stream);
   }} catch (e) {{
-    console.error('MediaRecorder init failed, trying without options', e);
+    log('MediaRecorder init error, retry default', String(e));
     mediaRecorder = new MediaRecorder(stream);
   }}
   chunks = [];
-  mediaRecorder.ondataavailable = e => e.data && chunks.push(e.data);
+  mediaRecorder.onstart = () => log('MediaRecorder started', mediaRecorder.mimeType);
+  mediaRecorder.ondataavailable = e => {{ if (e.data && e.data.size > 0) chunks.push(e.data); }};
+  mediaRecorder.onerror = e => log('MediaRecorder error', JSON.stringify(e));
   mediaRecorder.onstop = async () => {{
-    const blob = new Blob(chunks, {{ type: mediaRecorder.mimeType }});
-    await uploadAnswer(blob, extFromMime(mediaRecorder.mimeType));
-    stream.getTracks().forEach(t => t.stop());
+    log('MediaRecorder stopped, chunks', chunks.length);
+    try {{
+      const blob = new Blob(chunks, {{ type: mediaRecorder.mimeType || 'audio/webm' }});
+      await uploadAnswer(blob, extFromMime(mediaRecorder.mimeType || ''));
+    }} catch (err) {{
+      log('uploadAnswer error', String(err));
+    }} finally {{
+      try {{ stream.getTracks().forEach(t => t.stop()); }} catch (_){{
+      }}
+      hasRecordingStarted = false;
+    }}
   }};
   recStart = Date.now();
-  mediaRecorder.start();
+  try {{
+    // Use 1000ms timeslice to ensure dataavailable fires on some browsers
+    mediaRecorder.start(1000);
+  }} catch (e) {{
+    log('mediaRecorder.start failed', String(e));
+    mediaRecorder.start(); // fallback
+  }}
 }}
-function stopRecording() {{ try {{ mediaRecorder && mediaRecorder.stop(); }} catch (e) {{}} }}
+
+function stopRecording() {{
+  try {{
+    mediaRecorder && mediaRecorder.state !== 'inactive' && mediaRecorder.stop();
+  }} catch (e) {{
+    log('stopRecording error', String(e));
+  }}
+}}
 
 function showTranscriptEditor(initialText, confidence) {{
   const input = document.getElementById('transcriptEdit');
@@ -435,6 +493,7 @@ function showTranscriptEditor(initialText, confidence) {{
 }}
 
 async function uploadAnswer(blob, ext = 'webm') {{
+  log('uploadAnswer()', ext, blob.size);
   const fd = new FormData();
   fd.append('audio', blob, `answer.${{ext}}`);
   fd.append('session_id', sessionId);
@@ -443,10 +502,12 @@ async function uploadAnswer(blob, ext = 'webm') {{
   fd.append('duration_ms', String(Date.now() - recStart));
   const res = await fetch('/api/upload', {{ method: 'POST', body: fd }});
   const json = await res.json();
+  log('upload -> transcript length', (json.transcript || '').length, 'conf', json.confidence);
   showTranscriptEditor(json.transcript, json.confidence);
 }}
 
 async function confirmTranscript(text) {{
+  log('confirmTranscript()', text.slice(0, 60));
   const res = await fetch('/api/transcript/confirm', {{
     method: 'POST',
     headers: {{ 'Content-Type': 'application/json' }},
@@ -459,7 +520,26 @@ async function confirmTranscript(text) {{
 function setQuestion(q) {{ document.getElementById('question').textContent = q || ''; }}
 function setStage(s) {{ document.getElementById('stage').textContent = s || ''; }}
 
+// Always proceed to recording within ~2s even if TTS blocks
+async function askAndRecord(text, part, qid, maxMs) {{
+  setStage(`Part ${{part}}`);
+  setQuestion(text);
+  currentPart = part; currentQuestionId = qid;
+  let started = false;
+  const startNow = async () => {{
+    if (started) return;
+    started = true;
+    beep(120);
+    await startRecording();
+    setTimeout(() => stopRecording(), maxMs);
+  }};
+  // Fire a timer to guarantee start
+  const hardTimer = setTimeout(startNow, 1700);
+  await speak(text, {{ onend: () => {{ clearTimeout(hardTimer); startNow(); }} }});
+}}
+
 async function advanceExam(payload) {{
+  log('advanceExam()', payload);
   if (payload.result) {{
     setStage('Test finished.');
     setQuestion(`Overall ${{payload.result.overall}} — Fluency ${{payload.result.fluency}}, Lexis ${{payload.result.lexical_resource}}, Grammar ${{payload.result.grammar_range_accuracy}}, Pron ${{payload.result.pronunciation}}. ${{payload.result.summary}}`);
@@ -473,26 +553,16 @@ async function advanceExam(payload) {{
       setTimeout(async () => {{
         setStage('Part 2: Speak for up to 2 minutes…');
         beep(200);
-        await speak('You may begin.', {{ onend: async () => {{
-          currentPart = 2; currentQuestionId = 'p2_main';
-          await startRecording();
-          setTimeout(() => {{ stopRecording(); beep(200); }}, 120000);
-        }}}});
+        currentPart = 2; currentQuestionId = 'p2_main';
+        await askAndRecord('You may begin.', 2, 'p2_main', 120000);
       }}, 60000);
     }}}});
     return;
   }}
   if (payload.next_question) {{
     const q = payload.next_question;
-    currentPart = q.part; currentQuestionId = q.question_id;
-    setStage(`Part ${{q.part}}`);
-    setQuestion(q.text);
-    await speak(q.text, {{ onend: async () => {{
-      beep(120);
-      await startRecording();
-      const limit = (q.part === 1) ? 40000 : 50000;
-      setTimeout(() => {{ stopRecording(); }}, limit);
-    }}}});
+    const limit = (q.part === 1) ? 40000 : 50000;
+    await askAndRecord(q.text, q.part, q.question_id, limit);
   }}
 }}
 
@@ -504,14 +574,14 @@ async function bootstrap() {{
     body: JSON.stringify({{ tg_user_id: tgUserId }})
   }});
   const data = await res.json();
+  log('session start', data.session_id);
   sessionId = data.session_id;
   currentPart = 1;
   currentQuestionId = data.next_question.question_id;
-  setStage('Part 1');
+  // Speak intro, then first question → recording
   await speak(data.speak, {{ onend: async () => {{ await advanceExam({{ next_question: data.next_question }}); }}}});
 }}
 
-// Request mic before hiding overlay; keep overlay visible if user didn't grant yet.
 async function userStart() {{
   const msg = document.getElementById('overlayMsg');
   const btn = document.getElementById('startBtn');
@@ -526,22 +596,25 @@ async function userStart() {{
     setTimeout(() => {{ o.stop(); ctx.close(); }}, 30);
   }} catch (e) {{}}
 
+  // Pre-ask mic permission so later calls succeed without gesture
   let granted = false;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
     msg.textContent = 'This app cannot access your microphone here. Try "Open in browser".';
+    prelog('getUserMedia not available');
     btn.disabled = false;
     return;
   }}
   try {{
-    const s = await navigator.mediaDevices.getUserMedia({{ audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }} }});
+    const s = await navigator.mediaDevices.getUserMedia({{ audio: true }});
     s.getTracks().forEach(t => t.stop());
     granted = true;
+    prelog('Microphone permission granted');
   }} catch (e) {{
-    console.warn('Mic request failed or was denied:', e);
+    prelog('Mic pre-request error: ' + String(e));
   }}
 
   if (!granted) {{
-    msg.textContent = 'Microphone permission is required. Tap again and press "Allow" in the popup. If no popup appears, tap "Open in browser".';
+    msg.textContent = 'Microphone permission is required. Tap again and press "Allow".';
     btn.disabled = false;
     return;
   }}
@@ -561,4 +634,4 @@ async def webapp():
 
 @app.get("/")
 def health():
-    return {"ok": True}
+    return {"ok": True, "base_url": PUBLIC_BASE_URL}
