@@ -11,79 +11,29 @@ from scoring import metrics_from_text_and_times, bands_from_metrics
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 ELEVEN_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:8000"
-ELEVEN_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")  # Default ElevenLabs voice
+ELEVEN_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 ELEVEN_MODEL_ID = os.environ.get("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 
 # ====== App ======
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Same-origin calls in this app; allow all to avoid misconfig friction
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 @app.middleware("http")
 async def permissions_policy(request: Request, call_next):
     resp = await call_next(request)
-    # Allow mic + autoplay (helps some embedded webviews)
     resp.headers["Permissions-Policy"] = "microphone=(self), autoplay=(self)"
-    # Back-compat header name for older Chromium builds (harmless if ignored)
     resp.headers["Feature-Policy"] = "microphone 'self'; autoplay 'self'"
     return resp
 
 # ====== Models / Data ======
-# Keep tiny.en for fast CPU inference on free hosts
 whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
-
 PART1_TOPICS = {
-    "home": [
-        "Do you live in a house or an apartment?",
-        "What do you like most about your home?",
-        "Is there anything you would like to change about your home?"
-    ],
-    "work_study": [
-        "Do you work or are you a student?",
-        "Why did you choose your field?",
-        "What do you find most interesting about it?"
-    ],
-    "hobbies": [
-        "What do you like to do in your free time?",
-        "How long have you had this hobby?",
-        "Do you prefer to do it alone or with others?"
-    ],
+    "home": ["Do you live in a house or an apartment?", "What do you like most about your home?", "Is there anything you would like to change about your home?"],
+    "work_study": ["Do you work or are you a student?", "Why did you choose your field?", "What do you find most interesting about it?"],
+    "hobbies": ["What do you like to do in your free time?", "How long have you had this hobby?", "Do you prefer to do it alone or with others?"],
 }
-PART2_CARDS = [
-    {
-        "topic": "A market you have visited",
-        "prompt": "Describe a market you have visited. You should say: where it is, when you went there, what you bought, and explain how you felt about the place.",
-        "follow_up": "Do you think traditional markets will continue to be popular in the future?"
-    },
-    {
-        "topic": "A journey you enjoyed",
-        "prompt": "Describe a journey you enjoyed. You should say: where you went, why you went there, who you went with, and explain what you enjoyed about the journey.",
-        "follow_up": "How has travel changed in your country in recent years?"
-    }
-]
-PART3_THEMES = [
-    {
-        "theme": "Lifestyle and tradition",
-        "questions": [
-            "How do traditional markets influence community life?",
-            "What are the advantages and disadvantages of modern supermarkets?",
-            "How should cities balance tradition and modernization?"
-        ]
-    },
-    {
-        "theme": "Transport and mobility",
-        "questions": [
-            "How does improved transportation affect people’s work and leisure?",
-            "What are some environmental impacts of increased travel?",
-            "Should governments invest more in public transport? Why?"
-        ]
-    }
-]
+PART2_CARDS = [{"topic": "A market you have visited", "prompt": "Describe a market you have visited. You should say: where it is, when you went there, what you bought, and explain how you felt about the place.", "follow_up": "Do you think traditional markets will continue to be popular in the future?"}, {"topic": "A journey you enjoyed", "prompt": "Describe a journey you enjoyed. You should say: where you went, why you went there, who you went with, and explain what you enjoyed about the journey.", "follow_up": "How has travel changed in your country in recent years?"}]
+PART3_THEMES = [{"theme": "Lifestyle and tradition", "questions": ["How do traditional markets influence community life?", "What are the advantages and disadvantages of modern supermarkets?", "How should cities balance tradition and modernization?"]}, {"theme": "Transport and mobility", "questions": ["How does improved transportation affect people’s work and leisure?", "What are some environmental impacts of increased travel?", "Should governments invest more in public transport? Why?"]}]
 
 def extract_keywords(text: str, k: int = 5):
     stop = set("i me my we our ours ourselves you your yours yourself yourselves he him his she her it its they them their what which who whom this that these those am is are was were be been being have has had do does did a an the and but if or because as until while of at by for with about against between into through during before after above below to from up down in out on off over under again further then once here there when where why how all any both each few more most other some such no nor not only own same so than too very can will just should now".split())
@@ -102,64 +52,56 @@ def new_session(user_id: str) -> Dict[str, Any]:
     p1_questions = sum([[{"text": q, "topic": t} for q in PART1_TOPICS[t]] for t in topics], [])
     card = random.choice(PART2_CARDS)
     p3 = random.choice(PART3_THEMES)
-    SESSIONS[sid] = {
-        "id": sid,
-        "user_id": user_id,
-        "part": 1,
-        "p1_idx": 0,
-        "p1_qs": p1_questions,
-        "p2_card": card,
-        "p2_spoke": False,
-        "p3_idx": 0,
-        "p3_theme": p3,
-        "turns": [],
-        "start_ts": time.time()
-    }
+    SESSIONS[sid] = {"id": sid, "user_id": user_id, "part": 1, "p1_idx": 0, "p1_qs": p1_questions, "p2_card": card, "p2_spoke": False, "p3_idx": 0, "p3_theme": p3, "turns": [], "start_ts": time.time()}
     return SESSIONS[sid]
 
 # ====== API: TTS, Upload, Exam Flow ======
 @app.post("/api/tts")
 async def tts(text: str = Query(..., max_length=1200), voice_id: str | None = None, model_id: str | None = None):
+    # --- START OF DEBUGGING CODE ---
+    print("--- DEBUG: Attempting TTS request. ---")
     if not ELEVEN_API_KEY:
-        # Still allow flow to continue on the client
+        print("--- DEBUG: ELEVEN_API_KEY environment variable is NOT SET. ---")
         return JSONResponse({"error": "Missing ELEVENLABS_API_KEY"}, status_code=500)
+    
+    key_preview = f"{ELEVEN_API_KEY[:4]}...{ELEVEN_API_KEY[-4:]}" if len(ELEVEN_API_KEY) > 8 else "Key is too short to preview."
+    print(f"--- DEBUG: Using ElevenLabs API Key preview: {key_preview} ---")
+    # --- END OF DEBUGGING CODE ---
+
     vid = voice_id or ELEVEN_VOICE_ID
     mid = model_id or ELEVEN_MODEL_ID
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}/stream"
     headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
     payload = {"text": text, "model_id": mid, "voice_settings": {"stability": 0.6, "similarity_boost": 0.8}}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        if r.status_code != 200:
-            return JSONResponse({"error": r.text}, status_code=r.status_code)
-        return StreamingResponse(io.BytesIO(r.content), media_type="audio/mpeg")
+    
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            if r.status_code != 200:
+                error_detail = r.text
+                print(f"--- DEBUG: ElevenLabs API returned status {r.status_code} with body: {error_detail} ---")
+                try:
+                    error_json = r.json()
+                    error_detail = error_json.get("detail", {}).get("message", r.text)
+                except Exception: pass
+                return JSONResponse({"error": f"ElevenLabs API Error: {r.status_code} - {error_detail}"}, status_code=r.status_code)
+            return StreamingResponse(io.BytesIO(r.content), media_type="audio/mpeg")
+    except httpx.RequestError as exc:
+        print(f"--- DEBUG: An HTTPX error occurred: {exc!r} ---")
+        return JSONResponse({"error": f"HTTP request failed: {exc}"}, status_code=500)
 
 @app.post("/api/upload")
-async def upload(
-    audio: UploadFile,
-    session_id: str = Form(...),
-    part: int = Form(...),
-    question_id: str = Form(...),
-    duration_ms: int = Form(0)
-):
-    # Persist temp file with the right extension so ffmpeg can decode
+async def upload(audio: UploadFile, session_id: str = Form(...), part: int = Form(...), question_id: str = Form(...), duration_ms: int = Form(0)):
     suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(await audio.read())
         path = f.name
-    # Transcribe
     seg_iter, info = whisper_model.transcribe(path, language="en")
     segs = list(seg_iter)
     text = " ".join(s.text.strip() for s in segs).strip()
-    if segs:
-        conf_vals = [1.0 - getattr(s, "no_speech_prob", 0.0) for s in segs]
-        conf = max(0.0, min(1.0, sum(conf_vals) / len(conf_vals)))
-    else:
-        conf = 0.5
-    try:
-        os.remove(path)
-    except Exception:
-        pass
+    conf = max(0.0, min(1.0, sum([1.0 - getattr(s, "no_speech_prob", 0.0) for s in segs]) / len(segs))) if segs else 0.5
+    try: os.remove(path)
+    except Exception: pass
     return {"transcript": text, "confidence": conf, "duration_ms": duration_ms}
 
 @app.post("/api/session/start")
@@ -183,7 +125,7 @@ async def transcript_confirm(payload: Dict[str, Any]):
         words = len(re.findall(r"[a-zA-Z']+", text))
         too_short = words < 35 or duration_ms < 12000
         idx = sess["p1_idx"]
-        if too_short:
+        if too_short and not qid.endswith("_f"):
             return {"next_question": {"part": 1, "question_id": f"p1_{idx}_f", "text": "Could you tell me a bit more about that? For example, why is it important to you in your daily life?"}}
         sess["p1_idx"] += 1
         if sess["p1_idx"] < len(sess["p1_qs"]):
@@ -226,56 +168,23 @@ async def session_finish(payload: Dict[str, Any]):
     total_speech_ms = sum(t.get("duration_ms", 0) for t in sess["turns"])
     m = metrics_from_text_and_times(all_text, speech_ms=total_speech_ms, pauses_ms=0)
     bands = bands_from_metrics(m, asr_conf=0.7, rate_stability=0.7)
-    summary = (
-        ("Fluency: You spoke at a steady pace with generally coherent development; fillers and pauses did not impede communication."
-         if bands["fluency"] >= 6.5 else
-         "Fluency: Pace and pausing sometimes disrupted flow; aim to extend answers and reduce fillers for smoother delivery.")
-        + " " +
-        ("Lexical resource: Good range with appropriate word choice; limited repetition and some topic-specific vocabulary."
-         if bands["lexical_resource"] >= 6.5 else
-         "Lexical resource: Range was somewhat limited with repetition; try to vary expressions and use more precise terms.")
-        + " " +
-        ("Grammar: Mostly accurate with a mix of simple and some complex structures; few errors affecting meaning."
-         if bands["grammar_range_accuracy"] >= 6.5 else
-         "Grammar: Frequent basic errors and limited variety; practice complex sentences and check subject–verb agreement.")
-        + " " +
-        ("Pronunciation: Generally clear with understandable rhythm; minor issues did not reduce intelligibility."
-         if bands["pronunciation"] >= 6.5 else
-         "Pronunciation: Clarity and rhythm varied; work on connected speech and reduce hesitations.")
-    )
-    return {
-        "result": {
-            "overall": bands["overall"],
-            "fluency": bands["fluency"],
-            "lexical_resource": bands["lexical_resource"],
-            "grammar_range_accuracy": bands["grammar_range_accuracy"],
-            "pronunciation": bands["pronunciation"],
-            "summary": summary,
-            "recommendation": "Focus on extending answers with supporting details, vary vocabulary with precise terms, and practice complex sentences while maintaining clear rhythm."
-        }
-    }
+    summary = (("Fluency: You spoke at a steady pace with generally coherent development; fillers and pauses did not impede communication." if bands["fluency"] >= 6.5 else "Fluency: Pace and pausing sometimes disrupted flow; aim to extend answers and reduce fillers for smoother delivery.") + " " + ("Lexical resource: Good range with appropriate word choice; limited repetition and some topic-specific vocabulary." if bands["lexical_resource"] >= 6.5 else "Lexical resource: Range was somewhat limited with repetition; try to vary expressions and use more precise terms.") + " " + ("Grammar: Mostly accurate with a mix of simple and some complex structures; few errors affecting meaning." if bands["grammar_range_accuracy"] >= 6.5 else "Grammar: Frequent basic errors and limited variety; practice complex sentences and check subject–verb agreement.") + " " + ("Pronunciation: Generally clear with understandable rhythm; minor issues did not reduce intelligibility." if bands["pronunciation"] >= 6.5 else "Pronunciation: Clarity and rhythm varied; work on connected speech and reduce hesitations."))
+    return {"result": {"overall": bands["overall"], "fluency": bands["fluency"], "lexical_resource": bands["lexical_resource"], "grammar_range_accuracy": bands["grammar_range_accuracy"], "pronunciation": bands["pronunciation"], "summary": summary, "recommendation": "Focus on extending answers with supporting details, vary vocabulary with precise terms, and practice complex sentences while maintaining clear rhythm."}}
 
 # ====== Telegram Webhook ======
 @app.post("/telegram/webhook")
 async def telegram_webhook(update: Dict[str, Any]):
     if "message" in update:
         chat_id = update["message"]["chat"]["id"]
-        # Force Telegram to reload latest webapp via cache-busting param
-        url = f"{PUBLIC_BASE_URL}/webapp?v=6"
+        url = f"{PUBLIC_BASE_URL}/webapp?v=8" # Cache buster
         await send_webapp_button(chat_id, "Start Mock Speaking", url)
     return {"ok": True}
 
 async def send_webapp_button(chat_id: int, label: str, url: str):
     if not TELEGRAM_BOT_TOKEN: return
-    kb = {
-        "keyboard": [[{"text": label, "web_app": {"url": url}}]],
-        "resize_keyboard": True, "is_persistent": True
-    }
+    kb = {"keyboard": [[{"text": label, "web_app": {"url": url}}]], "resize_keyboard": True, "is_persistent": True}
     async with httpx.AsyncClient(timeout=30) as client:
-        await client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": "Tap to begin your mock speaking test:", "reply_markup": kb}
-        )
+        await client.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "Tap to begin your mock speaking test:", "reply_markup": kb})
 
 # ====== Web App (HTML + JS) ======
 HTML = f"""
@@ -309,7 +218,7 @@ HTML = f"""
       <button id="startBtn" class="btn">Tap to Start</button>
       <div class="small">If it doesn’t work, close and open again, then tap this button.</div>
       <div class="hint">If Telegram Desktop blocks the mic, open in your browser:</div>
-      <div class="small"><a class="link" href="{PUBLIC_BASE_URL}/webapp?v=6" target="_blank" rel="noopener">Open in browser</a></div>
+      <div class="small"><a class="link" href="{PUBLIC_BASE_URL}/webapp?v=8" target="_blank" rel="noopener">Open in browser</a></div>
       <div id="prelog" class="log"></div>
     </div>
   </div>
@@ -361,13 +270,13 @@ function beep(ms = 200, freq = 880) {{
   }} catch (e) {{}}
 }}
 
-// Speak with fail-safe: proceed after 1.5–2s even if audio is blocked
 async function speak(text, {{ onend }} = {{}}) {{
   log('speak()', text.slice(0, 80));
   try {{
     const res = await fetch(`/api/tts?text=${{encodeURIComponent(text)}}`, {{ method: 'POST' }});
     if (!res.ok) {{
-      log('TTS HTTP error', res.status);
+      const errJson = await res.json().catch(() => ({{ error: "TTS client error" }}));
+      log('TTS HTTP error', res.status, errJson.error);
       onend && onend();
       return;
     }}
@@ -385,9 +294,7 @@ async function speak(text, {{ onend }} = {{}}) {{
     audio.onplaying = () => clearTimeout(fallback);
     audio.onended = finish;
     const p = audio.play();
-    if (p && p.catch) {{
-      p.catch(err => {{ log('Autoplay blocked', String(err)); finish(); }});
-    }}
+    if (p && p.catch) {{ p.catch(err => {{ log('Autoplay blocked', String(err)); finish(); }}); }}
   }} catch (e) {{
     log('speak error', String(e));
     onend && onend();
@@ -395,17 +302,10 @@ async function speak(text, {{ onend }} = {{}}) {{
 }}
 
 function selectMimeType() {{
-  const types = [
-    'audio/webm;codecs=opus',
-    'audio/webm'
-  ];
+  const types = ['audio/webm;codecs=opus', 'audio/webm'];
   if (!window.MediaRecorder) return '';
-  for (const t of types) {{
-    try {{
-      if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t;
-    }} catch (_) {{}}
-  }}
-  return ''; // Let browser choose default
+  for (const t of types) {{ if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t; }}
+  return '';
 }}
 function extFromMime(m) {{
   if (!m) return 'webm';
@@ -449,27 +349,22 @@ async function startRecording() {{
     }} catch (err) {{
       log('uploadAnswer error', String(err));
     }} finally {{
-      try {{ stream.getTracks().forEach(t => t.stop()); }} catch (_){{
-      }}
+      try {{ stream.getTracks().forEach(t => t.stop()); }} catch (_){{}}
       hasRecordingStarted = false;
     }}
   }};
   recStart = Date.now();
   try {{
-    // Use 1000ms timeslice to ensure dataavailable fires on some browsers
     mediaRecorder.start(1000);
   }} catch (e) {{
     log('mediaRecorder.start failed', String(e));
-    mediaRecorder.start(); // fallback
+    mediaRecorder.start();
   }}
 }}
 
 function stopRecording() {{
-  try {{
-    mediaRecorder && mediaRecorder.state !== 'inactive' && mediaRecorder.stop();
-  }} catch (e) {{
-    log('stopRecording error', String(e));
-  }}
+  try {{ mediaRecorder && mediaRecorder.state !== 'inactive' && mediaRecorder.stop(); }}
+  catch (e) {{ log('stopRecording error', String(e)); }}
 }}
 
 function showTranscriptEditor(initialText, confidence) {{
@@ -481,10 +376,7 @@ function showTranscriptEditor(initialText, confidence) {{
   const iv = setInterval(() => {{
     left -= 1;
     timer.textContent = `${{left}}s to auto-confirm`;
-    if (left <= 0) {{
-      clearInterval(iv);
-      confirmTranscript(input.value);
-    }}
+    if (left <= 0) {{ clearInterval(iv); confirmTranscript(input.value); }}
   }}, 1000);
   document.getElementById('confirmBtn').onclick = () => {{
     clearInterval(iv);
@@ -520,7 +412,6 @@ async function confirmTranscript(text) {{
 function setQuestion(q) {{ document.getElementById('question').textContent = q || ''; }}
 function setStage(s) {{ document.getElementById('stage').textContent = s || ''; }}
 
-// Always proceed to recording within ~2s even if TTS blocks
 async function askAndRecord(text, part, qid, maxMs) {{
   setStage(`Part ${{part}}`);
   setQuestion(text);
@@ -533,7 +424,6 @@ async function askAndRecord(text, part, qid, maxMs) {{
     await startRecording();
     setTimeout(() => stopRecording(), maxMs);
   }};
-  // Fire a timer to guarantee start
   const hardTimer = setTimeout(startNow, 1700);
   await speak(text, {{ onend: () => {{ clearTimeout(hardTimer); startNow(); }} }});
 }}
@@ -578,7 +468,6 @@ async function bootstrap() {{
   sessionId = data.session_id;
   currentPart = 1;
   currentQuestionId = data.next_question.question_id;
-  // Speak intro, then first question → recording
   await speak(data.speak, {{ onend: async () => {{ await advanceExam({{ next_question: data.next_question }}); }}}});
 }}
 
@@ -588,7 +477,6 @@ async function userStart() {{
   btn.disabled = true;
   msg.textContent = 'Requesting microphone permission…';
 
-  // Unlock audio within gesture
   try {{
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const o = ctx.createOscillator(); const g = ctx.createGain();
@@ -596,7 +484,6 @@ async function userStart() {{
     setTimeout(() => {{ o.stop(); ctx.close(); }}, 30);
   }} catch (e) {{}}
 
-  // Pre-ask mic permission so later calls succeed without gesture
   let granted = false;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
     msg.textContent = 'This app cannot access your microphone here. Try "Open in browser".';
