@@ -58,28 +58,20 @@ def new_session(user_id: str) -> Dict[str, Any]:
 # ====== API: TTS, Upload, Exam Flow ======
 @app.post("/api/tts")
 async def tts(text: str = Query(..., max_length=1200), voice_id: str | None = None, model_id: str | None = None):
-    # --- START OF DEBUGGING CODE ---
-    print("--- DEBUG: Attempting TTS request. ---")
     if not ELEVEN_API_KEY:
-        print("--- DEBUG: ELEVEN_API_KEY environment variable is NOT SET. ---")
         return JSONResponse({"error": "Missing ELEVENLABS_API_KEY"}, status_code=500)
-    
-    key_preview = f"{ELEVEN_API_KEY[:4]}...{ELEVEN_API_KEY[-4:]}" if len(ELEVEN_API_KEY) > 8 else "Key is too short to preview."
-    print(f"--- DEBUG: Using ElevenLabs API Key preview: {key_preview} ---")
-    # --- END OF DEBUGGING CODE ---
 
     vid = voice_id or ELEVEN_VOICE_ID
     mid = model_id or ELEVEN_MODEL_ID
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{vid}/stream"
     headers = {"xi-api-key": ELEVEN_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
     payload = {"text": text, "model_id": mid, "voice_settings": {"stability": 0.6, "similarity_boost": 0.8}}
-    
+
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(url, headers=headers, json=payload)
             if r.status_code != 200:
                 error_detail = r.text
-                print(f"--- DEBUG: ElevenLabs API returned status {r.status_code} with body: {error_detail} ---")
                 try:
                     error_json = r.json()
                     error_detail = error_json.get("detail", {}).get("message", r.text)
@@ -87,7 +79,6 @@ async def tts(text: str = Query(..., max_length=1200), voice_id: str | None = No
                 return JSONResponse({"error": f"ElevenLabs API Error: {r.status_code} - {error_detail}"}, status_code=r.status_code)
             return StreamingResponse(io.BytesIO(r.content), media_type="audio/mpeg")
     except httpx.RequestError as exc:
-        print(f"--- DEBUG: An HTTPX error occurred: {exc!r} ---")
         return JSONResponse({"error": f"HTTP request failed: {exc}"}, status_code=500)
 
 @app.post("/api/upload")
@@ -176,7 +167,7 @@ async def session_finish(payload: Dict[str, Any]):
 async def telegram_webhook(update: Dict[str, Any]):
     if "message" in update:
         chat_id = update["message"]["chat"]["id"]
-        url = f"{PUBLIC_BASE_URL}/webapp?v=8" # Cache buster
+        url = f"{PUBLIC_BASE_URL}/webapp?v=11" # Cache buster
         await send_webapp_button(chat_id, "Start Mock Speaking", url)
     return {"ok": True}
 
@@ -207,7 +198,6 @@ HTML = f"""
     .small {{ font-size: 0.9rem; color: #aab; margin-top: 8px; }}
     .hint {{ font-size: 0.9rem; color: #9ac; margin-top: 10px; }}
     a.link {{ color: #7cf; }}
-    .log {{ font-size: 0.85rem; color: #8ab; margin-top: 6px; white-space: pre-line; }}
   </style>
 </head>
 <body>
@@ -218,8 +208,7 @@ HTML = f"""
       <button id="startBtn" class="btn">Tap to Start</button>
       <div class="small">If it doesn’t work, close and open again, then tap this button.</div>
       <div class="hint">If Telegram Desktop blocks the mic, open in your browser:</div>
-      <div class="small"><a class="link" href="{PUBLIC_BASE_URL}/webapp?v=8" target="_blank" rel="noopener">Open in browser</a></div>
-      <div id="prelog" class="log"></div>
+      <div class="small"><a class="link" href="{PUBLIC_BASE_URL}/webapp?v=11&localTts=1" target="_blank" rel="noopener">Open in browser</a></div>
     </div>
   </div>
 
@@ -231,11 +220,12 @@ HTML = f"""
       <button id="confirmBtn" class="btn">Confirm</button>
       <div id="editTimer" class="status"></div>
     </div>
-    <div id="log" class="log"></div>
   </div>
 
 <script>
 const tg = window.Telegram?.WebApp;
+tg && tg.expand();
+
 // Read mode from URL: if you open /webapp?...&localTts=1 we use free browser voice
 const params = new URLSearchParams(location.search);
 const useLocalTTS = params.get('localTts') === '1';
@@ -243,77 +233,85 @@ const supportsSpeech = 'speechSynthesis' in window && typeof window.SpeechSynthe
 
 // Load available voices (needed on some browsers)
 let voicesReady;
-function loadVoices() {
+function loadVoices() {{
   if (voicesReady) return voicesReady;
-  voicesReady = new Promise(resolve => {
+  voicesReady = new Promise(resolve => {{
     let v = window.speechSynthesis?.getVoices?.() || [];
     if (v.length) return resolve(v);
     const timer = setTimeout(() => resolve(window.speechSynthesis.getVoices()), 1200);
-    window.speechSynthesis.onvoiceschanged = () => {
+    window.speechSynthesis.onvoiceschanged = () => {{
       clearTimeout(timer);
       resolve(window.speechSynthesis.getVoices());
-    };
-  });
+    }};
+  }});
   return voicesReady;
-}
+}}
 
-function chooseEnglishVoice(voices) {
+function chooseEnglishVoice(voices) {{
   // Try to pick a clear English voice if possible
   let v = voices.find(x => /en-(US|GB)/i.test(x.lang) && /Google|Microsoft|Male/i.test(x.name))
        || voices.find(x => /en/i.test(x.lang))
        || voices[0];
   return v || null;
-}
+}}
 
-async function speak(text, { onend } = {}) {
-  // If we’re in local TTS mode and the browser supports it, speak locally for free
-  if (useLocalTTS && supportsSpeech) {
-    await speakLocal(text, { onend });
+async function speakLocal(text, options) {{
+  const onend = options && options.onend;
+  try {{
+    if (!supportsSpeech) {{ onend && onend(); return; }}
+    await loadVoices();
+    const u = new SpeechSynthesisUtterance(text);
+    const all = window.speechSynthesis.getVoices();
+    const picked = chooseEnglishVoice(all);
+    if (picked) u.voice = picked;
+    u.lang = (picked && picked.lang) || 'en-US';
+    u.rate = 1.0;
+    u.pitch = 1.0;
+
+    u.onend = () => {{ onend && onend(); }};
+    u.onerror = () => {{ onend && onend(); }};
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  }} catch (e) {{
+    console.warn('Local TTS error', e);
+    onend && onend();
+  }}
+}}
+
+async function speak(text, options) {{
+  const onend = options && options.onend;
+  if (useLocalTTS && supportsSpeech) {{
+    await speakLocal(text, options);
     return;
-  }
+  }}
 
-  // Otherwise try server TTS (ElevenLabs). If it fails, fall back to local TTS if possible.
-  try {
-    const res = await fetch(`/api/tts?text=${encodeURIComponent(text)}`, { method: 'POST' });
-    if (!res.ok) {
-      const errJson = await res.json().catch(() => ({ error: "TTS client error" }));
+  try {{
+    const res = await fetch(`/api/tts?text=${{encodeURIComponent(text)}}`, {{ method: 'POST' }});
+    if (!res.ok) {{
+      const errJson = await res.json().catch(() => ({{ error: "TTS client error" }}));
       console.warn('Server TTS error', res.status, errJson.error);
-      if (supportsSpeech) { await speakLocal(text, { onend }); } else { onend && onend(); }
+      if (supportsSpeech) {{ await speakLocal(text, options); }} else {{ onend && onend(); }}
       return;
-    }
+    }}
     const blob = await res.blob();
     const url = URL.createObjectURL(blob);
     const audio = new Audio(url);
     let finished = false;
-    const finish = () => {
+    const finish = () => {{
       if (finished) return;
       finished = true;
-      try { URL.revokeObjectURL(url); } catch(e) {}
+      try {{ URL.revokeObjectURL(url); }} catch(e) {{}}
       onend && onend();
-    };
+    }};
     const fallback = setTimeout(finish, 1800);
     audio.onplaying = () => clearTimeout(fallback);
     audio.onended = finish;
     const p = audio.play();
-    if (p && p.catch) { p.catch(err => { console.warn('Autoplay blocked', String(err)); finish(); }); }
-  } catch (e) {
+    if (p && p.catch) {{ p.catch(err => {{ console.warn('Autoplay blocked', String(err)); finish(); }}); }}
+  }} catch (e) {{
     console.warn('speak() fetch error', String(e));
-    if (supportsSpeech) { await speakLocal(text, { onend }); } else { onend && onend(); }
-  }
-}
-tg && tg.expand();
-
-const logEl = document.getElementById('log');
-const prelogEl = document.getElementById('prelog');
-function log(...args) {{
-  const s = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
-  console.log('[IELTS]', ...args);
-  if (logEl) logEl.textContent = (logEl.textContent || '') + s + '\\n';
-}}
-function prelog(...args) {{
-  const s = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
-  console.log('[START]', ...args);
-  if (prelogEl) prelogEl.textContent = (prelogEl.textContent || '') + s + '\\n';
+    if (supportsSpeech) {{ await speakLocal(text, options); }} else {{ onend && onend(); }}
+  }}
 }}
 
 let sessionId = null;
@@ -335,37 +333,6 @@ function beep(ms = 200, freq = 880) {{
   }} catch (e) {{}}
 }}
 
-async function speak(text, {{ onend }} = {{}}) {{
-  log('speak()', text.slice(0, 80));
-  try {{
-    const res = await fetch(`/api/tts?text=${{encodeURIComponent(text)}}`, {{ method: 'POST' }});
-    if (!res.ok) {{
-      const errJson = await res.json().catch(() => ({{ error: "TTS client error" }}));
-      log('TTS HTTP error', res.status, errJson.error);
-      onend && onend();
-      return;
-    }}
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const audio = new Audio(url);
-    let finished = false;
-    const finish = () => {{
-      if (finished) return;
-      finished = true;
-      try {{ URL.revokeObjectURL(url); }} catch(e) {{}}
-      onend && onend();
-    }};
-    const fallback = setTimeout(finish, 1800);
-    audio.onplaying = () => clearTimeout(fallback);
-    audio.onended = finish;
-    const p = audio.play();
-    if (p && p.catch) {{ p.catch(err => {{ log('Autoplay blocked', String(err)); finish(); }}); }}
-  }} catch (e) {{
-    log('speak error', String(e));
-    onend && onend();
-  }}
-}}
-
 function selectMimeType() {{
   const types = ['audio/webm;codecs=opus', 'audio/webm'];
   if (!window.MediaRecorder) return '';
@@ -382,7 +349,6 @@ function extFromMime(m) {{
 async function startRecording() {{
   if (hasRecordingStarted) return;
   hasRecordingStarted = true;
-  log('startRecording() called');
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
     alert('This environment does not allow microphone access. Please open in Chrome.');
     throw new Error('getUserMedia unavailable');
@@ -390,7 +356,6 @@ async function startRecording() {{
   try {{
     stream = await navigator.mediaDevices.getUserMedia({{ audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }} }});
   }} catch (e) {{
-    log('getUserMedia error', String(e));
     alert('Microphone permission is required. Please allow it and try again.');
     throw e;
   }}
@@ -399,20 +364,16 @@ async function startRecording() {{
   try {{
     mediaRecorder = options ? new MediaRecorder(stream, options) : new MediaRecorder(stream);
   }} catch (e) {{
-    log('MediaRecorder init error, retry default', String(e));
     mediaRecorder = new MediaRecorder(stream);
   }}
   chunks = [];
-  mediaRecorder.onstart = () => log('MediaRecorder started', mediaRecorder.mimeType);
   mediaRecorder.ondataavailable = e => {{ if (e.data && e.data.size > 0) chunks.push(e.data); }};
-  mediaRecorder.onerror = e => log('MediaRecorder error', JSON.stringify(e));
   mediaRecorder.onstop = async () => {{
-    log('MediaRecorder stopped, chunks', chunks.length);
     try {{
       const blob = new Blob(chunks, {{ type: mediaRecorder.mimeType || 'audio/webm' }});
       await uploadAnswer(blob, extFromMime(mediaRecorder.mimeType || ''));
     }} catch (err) {{
-      log('uploadAnswer error', String(err));
+      console.error('uploadAnswer error', String(err));
     }} finally {{
       try {{ stream.getTracks().forEach(t => t.stop()); }} catch (_){{}}
       hasRecordingStarted = false;
@@ -422,14 +383,13 @@ async function startRecording() {{
   try {{
     mediaRecorder.start(1000);
   }} catch (e) {{
-    log('mediaRecorder.start failed', String(e));
     mediaRecorder.start();
   }}
 }}
 
 function stopRecording() {{
   try {{ mediaRecorder && mediaRecorder.state !== 'inactive' && mediaRecorder.stop(); }}
-  catch (e) {{ log('stopRecording error', String(e)); }}
+  catch (e) {{ console.error('stopRecording error', String(e)); }}
 }}
 
 function showTranscriptEditor(initialText, confidence) {{
@@ -437,10 +397,10 @@ function showTranscriptEditor(initialText, confidence) {{
   input.value = initialText || '';
   const timer = document.getElementById('editTimer');
   let left = 5;
-  timer.textContent = `${{left}}s to auto-confirm`;
+  timer.textContent = `${{left}}s`;
   const iv = setInterval(() => {{
     left -= 1;
-    timer.textContent = `${{left}}s to auto-confirm`;
+    timer.textContent = `${{left}}s`;
     if (left <= 0) {{ clearInterval(iv); confirmTranscript(input.value); }}
   }}, 1000);
   document.getElementById('confirmBtn').onclick = () => {{
@@ -449,32 +409,31 @@ function showTranscriptEditor(initialText, confidence) {{
   }};
 }}
 
-async function uploadAnswer(blob, ext = 'webm') {
+async function uploadAnswer(blob, ext = 'webm') {{
   const fd = new FormData();
-  fd.append('audio', blob, `answer.${ext}`);
+  fd.append('audio', blob, `answer.${{ext}}`);
   fd.append('session_id', sessionId);
   fd.append('part', currentPart);
   fd.append('question_id', currentQuestionId);
   fd.append('duration_ms', String(Date.now() - recStart));
-  try {
-    const res = await fetch('/api/upload', { method: 'POST', body: fd });
-    const text = await res.text(); // read as text first (more robust in Telegram webview)
+  try {{
+    const res = await fetch('/api/upload', {{ method: 'POST', body: fd }});
+    const text = await res.text();
     let json;
-    try { json = JSON.parse(text); }
-    catch (e) {
+    try {{ json = JSON.parse(text); }}
+    catch (e) {{
       console.error('Upload parse error', e, text?.slice(0, 200));
       alert('Upload succeeded but response could not be read. Please try again.');
       return;
-    }
+    }}
     showTranscriptEditor(json.transcript, json.confidence);
-  } catch (err) {
+  }} catch (err) {{
     console.error("Upload fetch failed", err);
     alert("Could not upload your answer. Please check your connection and try again.");
-  }
-}
+  }}
+}}
 
 async function confirmTranscript(text) {{
-  log('confirmTranscript()', text.slice(0, 60));
   const res = await fetch('/api/transcript/confirm', {{
     method: 'POST',
     headers: {{ 'Content-Type': 'application/json' }},
@@ -504,7 +463,6 @@ async function askAndRecord(text, part, qid, maxMs) {{
 }}
 
 async function advanceExam(payload) {{
-  log('advanceExam()', payload);
   if (payload.result) {{
     setStage('Test finished.');
     setQuestion(`Overall ${{payload.result.overall}} — Fluency ${{payload.result.fluency}}, Lexis ${{payload.result.lexical_resource}}, Grammar ${{payload.result.grammar_range_accuracy}}, Pron ${{payload.result.pronunciation}}. ${{payload.result.summary}}`);
@@ -539,7 +497,6 @@ async function bootstrap() {{
     body: JSON.stringify({{ tg_user_id: tgUserId }})
   }});
   const data = await res.json();
-  log('session start', data.session_id);
   sessionId = data.session_id;
   currentPart = 1;
   currentQuestionId = data.next_question.question_id;
@@ -562,7 +519,6 @@ async function userStart() {{
   let granted = false;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
     msg.textContent = 'This app cannot access your microphone here. Try "Open in browser".';
-    prelog('getUserMedia not available');
     btn.disabled = false;
     return;
   }}
@@ -570,10 +526,7 @@ async function userStart() {{
     const s = await navigator.mediaDevices.getUserMedia({{ audio: true }});
     s.getTracks().forEach(t => t.stop());
     granted = true;
-    prelog('Microphone permission granted');
-  }} catch (e) {{
-    prelog('Mic pre-request error: ' + String(e));
-  }}
+  }} catch (e) {{}}
 
   if (!granted) {{
     msg.textContent = 'Microphone permission is required. Tap again and press "Allow".';
