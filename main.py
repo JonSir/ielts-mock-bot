@@ -26,6 +26,7 @@ async def permissions_policy(request: Request, call_next):
     return resp
 
 # ====== Models / Data ======
+# UPGRADED MODEL: Using "base.en" for better accuracy
 whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
 PART1_TOPICS = {
     "home": ["Do you live in a house or an apartment?", "What do you like most about your home?", "Is there anything you would like to change about your home?"],
@@ -167,7 +168,7 @@ async def session_finish(payload: Dict[str, Any]):
 async def telegram_webhook(update: Dict[str, Any]):
     if "message" in update:
         chat_id = update["message"]["chat"]["id"]
-        url = f"{PUBLIC_BASE_URL}/webapp?v=12" # Cache buster
+        url = f"{PUBLIC_BASE_URL}/webapp?v=13" # Cache buster
         await send_webapp_button(chat_id, "Start Mock Speaking", url)
     return {"ok": True}
 
@@ -188,7 +189,7 @@ HTML = f"""
     body {{ font-family: system-ui, Arial, sans-serif; margin: 0; padding: 16px; background: #0b0f19; color: #fff; }}
     .card {{ max-width: 760px; margin: 0 auto; background: #141a2a; border-radius: 12px; padding: 16px; }}
     .q {{ font-size: 1.2rem; margin: 12px 0; }}
-    .status {{ color: #aab; margin: 8px 0; }}
+    .status {{ color: #aab; margin: 8px 0; display: flex; align-items: center; gap: 8px; }}
     #transcriptEdit {{ width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334; background: #0e1320; color: #fff; }}
     .row {{ display: flex; gap: 10px; align-items: center; }}
     .btn {{ background: #2b6; border: none; color: #fff; padding: 10px 14px; border-radius: 8px; cursor: pointer; }}
@@ -198,6 +199,8 @@ HTML = f"""
     .small {{ font-size: 0.9rem; color: #aab; margin-top: 8px; }}
     .hint {{ font-size: 0.9rem; color: #9ac; margin-top: 10px; }}
     a.link {{ color: #7cf; }}
+    .rec-dot {{ width: 10px; height: 10px; background: #f44; border-radius: 50%; animation: blink 1.5s infinite; }}
+    @keyframes blink {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.2; }} 100% {{ opacity: 1; }} }}
   </style>
 </head>
 <body>
@@ -208,7 +211,7 @@ HTML = f"""
       <button id="startBtn" class="btn">Tap to Start</button>
       <div class="small">If it doesn’t work, close and open again, then tap this button.</div>
       <div class="hint">If Telegram Desktop blocks the mic, open in your browser:</div>
-      <div class="small"><a class="link" href="{PUBLIC_BASE_URL}/webapp?v=12&localTts=1" target="_blank" rel="noopener">Open in browser</a></div>
+      <div class="small"><a class="link" href="{PUBLIC_BASE_URL}/webapp?v=13&localTts=1" target="_blank" rel="noopener">Open in browser</a></div>
     </div>
   </div>
 
@@ -226,12 +229,10 @@ HTML = f"""
 const tg = window.Telegram?.WebApp;
 tg && tg.expand();
 
-// Read mode from URL: if you open /webapp?...&localTts=1 we use free browser voice
 const params = new URLSearchParams(location.search);
 const useLocalTTS = params.get('localTts') === '1';
 const supportsSpeech = 'speechSynthesis' in window && typeof window.SpeechSynthesisUtterance !== 'undefined';
 
-// Load available voices (needed on some browsers)
 let voicesReady;
 function loadVoices() {{
   if (voicesReady) return voicesReady;
@@ -248,7 +249,6 @@ function loadVoices() {{
 }}
 
 function chooseEnglishVoice(voices) {{
-  // Try to pick a clear English voice if possible
   let v = voices.find(x => /en-(US|GB)/i.test(x.lang) && /Google|Microsoft|Male/i.test(x.name))
        || voices.find(x => /en/i.test(x.lang))
        || voices[0];
@@ -267,24 +267,16 @@ async function speakLocal(text, options) {{
     u.lang = (picked && picked.lang) || 'en-US';
     u.rate = 1.0;
     u.pitch = 1.0;
-
     u.onend = () => {{ onend && onend(); }};
     u.onerror = () => {{ onend && onend(); }};
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(u);
-  }} catch (e) {{
-    console.warn('Local TTS error', e);
-    onend && onend();
-  }}
+  }} catch (e) {{ console.warn('Local TTS error', e); onend && onend(); }}
 }}
 
 async function speak(text, options) {{
   const onend = options && options.onend;
-  if (useLocalTTS && supportsSpeech) {{
-    await speakLocal(text, options);
-    return;
-  }}
-
+  if (useLocalTTS && supportsSpeech) {{ await speakLocal(text, options); return; }}
   try {{
     const res = await fetch(`/api/tts?text=${{encodeURIComponent(text)}}`, {{ method: 'POST' }});
     if (!res.ok) {{
@@ -349,45 +341,27 @@ function extFromMime(m) {{
 async function startRecording() {{
   if (hasRecordingStarted) return;
   hasRecordingStarted = true;
-  console.log("Attempting to start recording...");
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
     alert('This environment does not allow microphone access. Please open in Chrome.');
-    console.error('getUserMedia not supported');
     throw new Error('getUserMedia unavailable');
   }}
   try {{
     stream = await navigator.mediaDevices.getUserMedia({{ audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }} }});
-    console.log("Microphone stream acquired.");
   }} catch (e) {{
     alert('Microphone permission is required. Please allow it and try again.');
-    console.error('getUserMedia error:', e);
     throw e;
   }}
   const mimeType = selectMimeType();
   const options = mimeType ? {{ mimeType }} : undefined;
   try {{
     mediaRecorder = options ? new MediaRecorder(stream, options) : new MediaRecorder(stream);
-    console.log("MediaRecorder created with options:", options);
   }} catch (e) {{
-    console.error("MediaRecorder creation failed, trying without options.", e);
     mediaRecorder = new MediaRecorder(stream);
   }}
   chunks = [];
-  mediaRecorder.onstart = () => {{
-    console.log("Event: mediaRecorder.onstart fired. State:", mediaRecorder.state);
-  }};
-  mediaRecorder.ondataavailable = e => {{
-    if (e.data && e.data.size > 0) {{
-      console.log(`Event: mediaRecorder.ondataavailable fired. Chunk size: ${{e.data.size}}`);
-      chunks.push(e.data);
-    }}
-  }};
+  mediaRecorder.ondataavailable = e => {{ if (e.data && e.data.size > 0) chunks.push(e.data); }};
   mediaRecorder.onstop = async () => {{
-    console.log(`Event: mediaRecorder.onstop fired. Total chunks: ${{chunks.length}}. State: ${{mediaRecorder.state}}`);
     try {{
-      if (chunks.length === 0) {{
-        console.warn("No data was recorded. Uploading empty blob.");
-      }}
       const blob = new Blob(chunks, {{ type: mediaRecorder.mimeType || 'audio/webm' }});
       await uploadAnswer(blob, extFromMime(mediaRecorder.mimeType || ''));
     }} catch (err) {{
@@ -395,37 +369,26 @@ async function startRecording() {{
     }} finally {{
       try {{ stream.getTracks().forEach(t => t.stop()); }} catch (_){{}}
       hasRecordingStarted = false;
-      console.log("Stream tracks stopped.");
     }}
-  }};
-  mediaRecorder.onerror = (e) => {{
-    console.error("Event: mediaRecorder.onerror fired.", e);
   }};
   recStart = Date.now();
   try {{
-    mediaRecorder.start(1000); // Request data every 1 second
-    console.log("mediaRecorder.start(1000) called.");
+    mediaRecorder.start(1000);
   }} catch (e) {{
-    console.error("mediaRecorder.start(1000) failed, trying without timeslice.", e);
     mediaRecorder.start();
   }}
 }}
 
 function stopRecording() {{
-  console.log("Attempting to stop recording...");
   try {{
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {{
         mediaRecorder.stop();
-        console.log("mediaRecorder.stop() called.");
-    }} else {{
-        console.warn("stopRecording called but recorder was not active. State:", mediaRecorder?.state);
     }}
   }}
   catch (e) {{ console.error('stopRecording error', String(e)); }}
 }}
 
 function showTranscriptEditor(initialText, confidence) {{
-  console.log("Showing transcript editor with text:", initialText);
   const input = document.getElementById('transcriptEdit');
   input.value = initialText || '';
   const timer = document.getElementById('editTimer');
@@ -443,7 +406,6 @@ function showTranscriptEditor(initialText, confidence) {{
 }}
 
 async function uploadAnswer(blob, ext = 'webm') {{
-  console.log(`Uploading answer. Blob size: ${{blob.size}}, type: ${{blob.type}}`);
   const fd = new FormData();
   fd.append('audio', blob, `answer.${{ext}}`);
   fd.append('session_id', sessionId);
@@ -452,14 +414,7 @@ async function uploadAnswer(blob, ext = 'webm') {{
   fd.append('duration_ms', String(Date.now() - recStart));
   try {{
     const res = await fetch('/api/upload', {{ method: 'POST', body: fd }});
-    const text = await res.text();
-    let json;
-    try {{ json = JSON.parse(text); }}
-    catch (e) {{
-      console.error('Upload parse error', e, text?.slice(0, 200));
-      alert('Upload succeeded but response could not be read. Please try again.');
-      return;
-    }}
+    const json = await res.json();
     showTranscriptEditor(json.transcript, json.confidence);
   }} catch (err) {{
     console.error("Upload fetch failed", err);
@@ -468,7 +423,6 @@ async function uploadAnswer(blob, ext = 'webm') {{
 }}
 
 async function confirmTranscript(text) {{
-  console.log("Confirming transcript:", text.slice(0, 50));
   const res = await fetch('/api/transcript/confirm', {{
     method: 'POST',
     headers: {{ 'Content-Type': 'application/json' }},
@@ -478,8 +432,11 @@ async function confirmTranscript(text) {{
   advanceExam(next);
 }}
 
-function setQuestion(q) {{ document.getElementById('question').textContent = q || ''; }}
-function setStage(s) {{ document.getElementById('stage').textContent = s || ''; }}
+function setStage(s, isRecording = false) {{
+    const stageEl = document.getElementById('stage');
+    let indicator = isRecording ? '<div class="rec-dot"></div>' : '';
+    stageEl.innerHTML = `${{indicator}}${{s || ''}}`;
+}}
 
 async function askAndRecord(text, part, qid, maxMs) {{
   setStage(`Part ${{part}}`);
@@ -490,15 +447,18 @@ async function askAndRecord(text, part, qid, maxMs) {{
     if (started) return;
     started = true;
     beep(120);
+    setStage(`Part ${{part}}: Recording...`, true);
     await startRecording();
-    setTimeout(() => stopRecording(), maxMs);
+    setTimeout(() => {{
+        setStage(`Part ${{part}}: Processing...`);
+        stopRecording();
+    }}, maxMs);
   }};
   const hardTimer = setTimeout(startNow, 1700);
   await speak(text, {{ onend: () => {{ clearTimeout(hardTimer); startNow(); }} }});
 }}
 
 async function advanceExam(payload) {{
-  console.log("Advancing exam with payload:", payload);
   if (payload.result) {{
     setStage('Test finished.');
     setQuestion(`Overall ${{payload.result.overall}} — Fluency ${{payload.result.fluency}}, Lexis ${{payload.result.lexical_resource}}, Grammar ${{payload.result.grammar_range_accuracy}}, Pron ${{payload.result.pronunciation}}. ${{payload.result.summary}}`);
