@@ -26,7 +26,7 @@ async def permissions_policy(request: Request, call_next):
     return resp
 
 # ====== Models / Data ======
-whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
 PART1_TOPICS = {
     "home": ["Do you live in a house or an apartment?", "What do you like most about your home?", "Is there anything you would like to change about your home?"],
     "work_study": ["Do you work or are you a student?", "Why did you choose your field?", "What do you find most interesting about it?"],
