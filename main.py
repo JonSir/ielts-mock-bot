@@ -236,6 +236,71 @@ HTML = f"""
 
 <script>
 const tg = window.Telegram?.WebApp;
+// Read mode from URL: if you open /webapp?...&localTts=1 we use free browser voice
+const params = new URLSearchParams(location.search);
+const useLocalTTS = params.get('localTts') === '1';
+const supportsSpeech = 'speechSynthesis' in window && typeof window.SpeechSynthesisUtterance !== 'undefined';
+
+// Load available voices (needed on some browsers)
+let voicesReady;
+function loadVoices() {
+  if (voicesReady) return voicesReady;
+  voicesReady = new Promise(resolve => {
+    let v = window.speechSynthesis?.getVoices?.() || [];
+    if (v.length) return resolve(v);
+    const timer = setTimeout(() => resolve(window.speechSynthesis.getVoices()), 1200);
+    window.speechSynthesis.onvoiceschanged = () => {
+      clearTimeout(timer);
+      resolve(window.speechSynthesis.getVoices());
+    };
+  });
+  return voicesReady;
+}
+
+function chooseEnglishVoice(voices) {
+  // Try to pick a clear English voice if possible
+  let v = voices.find(x => /en-(US|GB)/i.test(x.lang) && /Google|Microsoft|Male/i.test(x.name))
+       || voices.find(x => /en/i.test(x.lang))
+       || voices[0];
+  return v || null;
+}
+
+async function speak(text, { onend } = {}) {
+  // If we’re in local TTS mode and the browser supports it, speak locally for free
+  if (useLocalTTS && supportsSpeech) {
+    await speakLocal(text, { onend });
+    return;
+  }
+
+  // Otherwise try server TTS (ElevenLabs). If it fails, fall back to local TTS if possible.
+  try {
+    const res = await fetch(`/api/tts?text=${encodeURIComponent(text)}`, { method: 'POST' });
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({ error: "TTS client error" }));
+      console.warn('Server TTS error', res.status, errJson.error);
+      if (supportsSpeech) { await speakLocal(text, { onend }); } else { onend && onend(); }
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      try { URL.revokeObjectURL(url); } catch(e) {}
+      onend && onend();
+    };
+    const fallback = setTimeout(finish, 1800);
+    audio.onplaying = () => clearTimeout(fallback);
+    audio.onended = finish;
+    const p = audio.play();
+    if (p && p.catch) { p.catch(err => { console.warn('Autoplay blocked', String(err)); finish(); }); }
+  } catch (e) {
+    console.warn('speak() fetch error', String(e));
+    if (supportsSpeech) { await speakLocal(text, { onend }); } else { onend && onend(); }
+  }
+}
 tg && tg.expand();
 
 const logEl = document.getElementById('log');
@@ -384,19 +449,29 @@ function showTranscriptEditor(initialText, confidence) {{
   }};
 }}
 
-async function uploadAnswer(blob, ext = 'webm') {{
-  log('uploadAnswer()', ext, blob.size);
+async function uploadAnswer(blob, ext = 'webm') {
   const fd = new FormData();
-  fd.append('audio', blob, `answer.${{ext}}`);
+  fd.append('audio', blob, `answer.${ext}`);
   fd.append('session_id', sessionId);
   fd.append('part', currentPart);
   fd.append('question_id', currentQuestionId);
   fd.append('duration_ms', String(Date.now() - recStart));
-  const res = await fetch('/api/upload', {{ method: 'POST', body: fd }});
-  const json = await res.json();
-  log('upload -> transcript length', (json.transcript || '').length, 'conf', json.confidence);
-  showTranscriptEditor(json.transcript, json.confidence);
-}}
+  try {
+    const res = await fetch('/api/upload', { method: 'POST', body: fd });
+    const text = await res.text(); // read as text first (more robust in Telegram webview)
+    let json;
+    try { json = JSON.parse(text); }
+    catch (e) {
+      console.error('Upload parse error', e, text?.slice(0, 200));
+      alert('Upload succeeded but response could not be read. Please try again.');
+      return;
+    }
+    showTranscriptEditor(json.transcript, json.confidence);
+  } catch (err) {
+    console.error("Upload fetch failed", err);
+    alert("Could not upload your answer. Please check your connection and try again.");
+  }
+}
 
 async function confirmTranscript(text) {{
   log('confirmTranscript()', text.slice(0, 60));
