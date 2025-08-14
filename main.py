@@ -167,7 +167,7 @@ async def session_finish(payload: Dict[str, Any]):
 async def telegram_webhook(update: Dict[str, Any]):
     if "message" in update:
         chat_id = update["message"]["chat"]["id"]
-        url = f"{PUBLIC_BASE_URL}/webapp?v=11" # Cache buster
+        url = f"{PUBLIC_BASE_URL}/webapp?v=12" # Cache buster
         await send_webapp_button(chat_id, "Start Mock Speaking", url)
     return {"ok": True}
 
@@ -208,7 +208,7 @@ HTML = f"""
       <button id="startBtn" class="btn">Tap to Start</button>
       <div class="small">If it doesn’t work, close and open again, then tap this button.</div>
       <div class="hint">If Telegram Desktop blocks the mic, open in your browser:</div>
-      <div class="small"><a class="link" href="{PUBLIC_BASE_URL}/webapp?v=11&localTts=1" target="_blank" rel="noopener">Open in browser</a></div>
+      <div class="small"><a class="link" href="{PUBLIC_BASE_URL}/webapp?v=12&localTts=1" target="_blank" rel="noopener">Open in browser</a></div>
     </div>
   </div>
 
@@ -349,50 +349,83 @@ function extFromMime(m) {{
 async function startRecording() {{
   if (hasRecordingStarted) return;
   hasRecordingStarted = true;
+  console.log("Attempting to start recording...");
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
     alert('This environment does not allow microphone access. Please open in Chrome.');
+    console.error('getUserMedia not supported');
     throw new Error('getUserMedia unavailable');
   }}
   try {{
     stream = await navigator.mediaDevices.getUserMedia({{ audio: {{ echoCancellation: true, noiseSuppression: true, autoGainControl: true }} }});
+    console.log("Microphone stream acquired.");
   }} catch (e) {{
     alert('Microphone permission is required. Please allow it and try again.');
+    console.error('getUserMedia error:', e);
     throw e;
   }}
   const mimeType = selectMimeType();
   const options = mimeType ? {{ mimeType }} : undefined;
   try {{
     mediaRecorder = options ? new MediaRecorder(stream, options) : new MediaRecorder(stream);
+    console.log("MediaRecorder created with options:", options);
   }} catch (e) {{
+    console.error("MediaRecorder creation failed, trying without options.", e);
     mediaRecorder = new MediaRecorder(stream);
   }}
   chunks = [];
-  mediaRecorder.ondataavailable = e => {{ if (e.data && e.data.size > 0) chunks.push(e.data); }};
+  mediaRecorder.onstart = () => {{
+    console.log("Event: mediaRecorder.onstart fired. State:", mediaRecorder.state);
+  }};
+  mediaRecorder.ondataavailable = e => {{
+    if (e.data && e.data.size > 0) {{
+      console.log(`Event: mediaRecorder.ondataavailable fired. Chunk size: ${{e.data.size}}`);
+      chunks.push(e.data);
+    }}
+  }};
   mediaRecorder.onstop = async () => {{
+    console.log(`Event: mediaRecorder.onstop fired. Total chunks: ${{chunks.length}}. State: ${{mediaRecorder.state}}`);
     try {{
+      if (chunks.length === 0) {{
+        console.warn("No data was recorded. Uploading empty blob.");
+      }}
       const blob = new Blob(chunks, {{ type: mediaRecorder.mimeType || 'audio/webm' }});
       await uploadAnswer(blob, extFromMime(mediaRecorder.mimeType || ''));
     }} catch (err) {{
-      console.error('uploadAnswer error', String(err));
+      console.error('Error in onstop handler:', String(err));
     }} finally {{
       try {{ stream.getTracks().forEach(t => t.stop()); }} catch (_){{}}
       hasRecordingStarted = false;
+      console.log("Stream tracks stopped.");
     }}
+  }};
+  mediaRecorder.onerror = (e) => {{
+    console.error("Event: mediaRecorder.onerror fired.", e);
   }};
   recStart = Date.now();
   try {{
-    mediaRecorder.start(1000);
+    mediaRecorder.start(1000); // Request data every 1 second
+    console.log("mediaRecorder.start(1000) called.");
   }} catch (e) {{
+    console.error("mediaRecorder.start(1000) failed, trying without timeslice.", e);
     mediaRecorder.start();
   }}
 }}
 
 function stopRecording() {{
-  try {{ mediaRecorder && mediaRecorder.state !== 'inactive' && mediaRecorder.stop(); }}
+  console.log("Attempting to stop recording...");
+  try {{
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {{
+        mediaRecorder.stop();
+        console.log("mediaRecorder.stop() called.");
+    }} else {{
+        console.warn("stopRecording called but recorder was not active. State:", mediaRecorder?.state);
+    }}
+  }}
   catch (e) {{ console.error('stopRecording error', String(e)); }}
 }}
 
 function showTranscriptEditor(initialText, confidence) {{
+  console.log("Showing transcript editor with text:", initialText);
   const input = document.getElementById('transcriptEdit');
   input.value = initialText || '';
   const timer = document.getElementById('editTimer');
@@ -410,6 +443,7 @@ function showTranscriptEditor(initialText, confidence) {{
 }}
 
 async function uploadAnswer(blob, ext = 'webm') {{
+  console.log(`Uploading answer. Blob size: ${{blob.size}}, type: ${{blob.type}}`);
   const fd = new FormData();
   fd.append('audio', blob, `answer.${{ext}}`);
   fd.append('session_id', sessionId);
@@ -434,6 +468,7 @@ async function uploadAnswer(blob, ext = 'webm') {{
 }}
 
 async function confirmTranscript(text) {{
+  console.log("Confirming transcript:", text.slice(0, 50));
   const res = await fetch('/api/transcript/confirm', {{
     method: 'POST',
     headers: {{ 'Content-Type': 'application/json' }},
@@ -463,6 +498,7 @@ async function askAndRecord(text, part, qid, maxMs) {{
 }}
 
 async function advanceExam(payload) {{
+  console.log("Advancing exam with payload:", payload);
   if (payload.result) {{
     setStage('Test finished.');
     setQuestion(`Overall ${{payload.result.overall}} — Fluency ${{payload.result.fluency}}, Lexis ${{payload.result.lexical_resource}}, Grammar ${{payload.result.grammar_range_accuracy}}, Pron ${{payload.result.pronunciation}}. ${{payload.result.summary}}`);
