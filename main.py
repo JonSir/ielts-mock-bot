@@ -313,6 +313,8 @@ let recStart = 0;
 let mediaRecorder, chunks = [], stream;
 let hasRecordingStarted = false;
 
+let audioCtx = null, analyser = null, silenceTimer = null, lastSpeechTs = 0;
+
 function beep(ms = 200, freq = 880) {{
   try {{
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -361,11 +363,15 @@ async function startRecording() {{
   chunks = [];
   mediaRecorder.ondataavailable = e => {{ if (e.data && e.data.size > 0) chunks.push(e.data); }};
   mediaRecorder.onstop = async () => {{
+  mediaRecorder.onstart = () => {{ try {{ startVAD(stream); }} catch(e) {{ console.warn('VAD start failed', e); }} }};
+
     try {{
       const blob = new Blob(chunks, {{ type: mediaRecorder.mimeType || 'audio/webm' }});
       await uploadAnswer(blob, extFromMime(mediaRecorder.mimeType || ''));
     }} catch (err) {{
       console.error('Error in onstop handler:', String(err));
+      try { stopVAD(); } catch(e) { console.warn('VAD stop failed', e); }
+
     }} finally {{
       try {{ stream.getTracks().forEach(t => t.stop()); }} catch (_){{}}
       hasRecordingStarted = false;
@@ -434,8 +440,59 @@ async function confirmTranscript(text) {{
 
 function setStage(s, isRecording = false) {{
     const stageEl = document.getElementById('stage');
-    let indicator = isRecording ? '<div class="rec-dot"></div>' : '';
+    const indicator = isRecording ? '<div class="rec-dot"></div>' : '';
     stageEl.innerHTML = `${{indicator}}${{s || ''}}`;
+}}
+
+function setQuestion(q) {{ document.getElementById('question').textContent = q || ''; }}
+
+// ---- Simple Voice Activity Detection (VAD) to auto-finish on long silence ----
+function startVAD(stream) {{
+  try {{
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.fftSize);
+    lastSpeechTs = Date.now();
+
+    const silenceThreshold = 0.02; // ~2% RMS amplitude
+    const minSpeakMs = 4000;       // don't end too fast
+    const maxSilenceMs = 2500;     // end if >=2.5s silence
+
+    function rmsLevel() {{
+      analyser.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) {{
+        const v = (data[i] - 128) / 128; // -1..1
+        sum += v * v;
+      }}
+      return Math.sqrt(sum / data.length);
+    }}
+
+    silenceTimer = setInterval(() => {{
+      const level = rmsLevel();
+      const now = Date.now();
+      if (level > silenceThreshold) {{
+        lastSpeechTs = now;
+      }}
+      const spokeLongEnough = now - recStart > minSpeakMs;
+      const longSilence = now - lastSpeechTs > maxSilenceMs;
+      if (spokeLongEnough && longSilence) {{
+        setStage(`Part ${{currentPart}}: Processing...`);
+        try {{ stopRecording(); }} catch(e) {{}}
+      }}
+    }}, 150);
+  }} catch (e) {{
+    console.warn('VAD init failed', e);
+  }}
+}}
+
+function stopVAD() {{
+  try {{ if (silenceTimer) {{ clearInterval(silenceTimer); silenceTimer = null; }} }} catch(e) {{}}
+  // keep audioCtx for reuse; disconnect analyser
+  try {{ if (analyser) {{ analyser.disconnect(); analyser = null; }} }} catch(e) {{}}
 }}
 
 async function askAndRecord(text, part, qid, maxMs) {{
